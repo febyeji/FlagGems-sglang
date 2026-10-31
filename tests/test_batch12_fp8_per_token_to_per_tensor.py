@@ -101,22 +101,30 @@ CASES = [
 ]
 
 
+BACKENDS = ["generic", "kunlunxin", "ascend"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("experts,tokens,width,rows", CASES)
-def test_fp8_per_token_to_per_tensor_shapes(experts, tokens, width, rows):
+def test_fp8_per_token_to_per_tensor_shapes(
+    backend, experts, tokens, width, rows
+):
     args = make(experts, tokens, width, rows, seed=experts * 131 + width)
-    actual = load()(*args)
+    actual = load(backend)(*args)
     assert_matches(actual, reference(*args), args[2])
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_fp8_per_token_to_per_tensor_masked_dtype(dtype):
+def test_fp8_per_token_to_per_tensor_masked_dtype(backend, dtype):
     x, x_scale, masked_m, output_scale = make(3, 32, 512, [32, 0, 17], seed=5)
     masked_m = masked_m.to(dtype)
     args = (x, x_scale, masked_m, output_scale)
-    assert_matches(load()(*args), reference(*args), masked_m)
+    assert_matches(load(backend)(*args), reference(*args), masked_m)
 
 
-def test_fp8_per_token_to_per_tensor_all_input_bytes():
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_fp8_per_token_to_per_tensor_all_input_bytes(backend):
     # Every finite E4M3FN pattern must widen exactly, NaN included.
     width = 256
     codes = torch.arange(256, device="cuda", dtype=torch.uint8)
@@ -125,15 +133,16 @@ def test_fp8_per_token_to_per_tensor_all_input_bytes():
     masked_m = torch.tensor([1], device="cuda", dtype=torch.int32)
     output_scale = torch.ones(1, device="cuda")
     args = (x, x_scale, masked_m, output_scale)
-    actual = load()(*args).view(torch.uint8)
+    actual = load(backend)(*args).view(torch.uint8)
     expected = reference(*args).view(torch.uint8)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-def test_fp8_per_token_to_per_tensor_leaves_input_alone():
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_fp8_per_token_to_per_tensor_leaves_input_alone(backend):
     args = make(2, 16, 1024, [16, 5], seed=11)
     before = tuple(t.clone() for t in args)
-    load()(*args)
+    load(backend)(*args)
     for got, want in zip(args, before):
         torch.testing.assert_close(
             got.view(torch.uint8) if got.dtype == torch.float8_e4m3fn else got,
