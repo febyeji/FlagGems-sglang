@@ -78,14 +78,20 @@ def _requantize(
     token = row % T
     column = tl.program_id(1) * TILE + tl.arange(0, TILE)
     live = column < K
-    kept = live & (token < tl.load(M + expert))
+    # The row count and the per-tensor scale are read as lane-wide vectors.
+    # Reading either as a scalar is the one construct this compiler has
+    # rejected through every shape of this kernel.
+    lane = tl.zeros((TILE,), tl.int32)
+    rows = tl.load(M + (lane + expert))
+    inverse = 1.0 / tl.load(OS + lane)
+    kept = live & (token < rows)
     byte = tl.load(X + expert * XE + token * XT + column, kept, other=0)
     scale = tl.load(
         S + expert * SE + token * ST + column // SPAN, kept, other=0.0
     )
     # Masked lanes read code zero, which widens to zero and encodes back to
     # zero, so those rows store their zero bytes without a separate branch.
-    value = tl.load(W + byte.to(tl.int32)) * scale * (1.0 / tl.load(OS))
+    value = tl.load(W + byte.to(tl.int32)) * scale * inverse
     tl.store(Y + expert * YE + token * YT + column, _encode_fp8(value), live)
 
 
