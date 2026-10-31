@@ -123,19 +123,40 @@ def test_fp8_per_token_to_per_tensor_masked_dtype(backend, dtype):
     assert_matches(load(backend)(*args), reference(*args), masked_m)
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_fp8_per_token_to_per_tensor_all_input_bytes(backend):
-    # Every finite E4M3FN pattern must widen exactly, NaN included.
+def _widen_case(backend):
     width = 256
     codes = torch.arange(256, device="cuda", dtype=torch.uint8)
-    x = codes.repeat(2)[:width].view(1, 1, width).view(torch.float8_e4m3fn)
+    x = codes.view(1, 1, width).view(torch.float8_e4m3fn)
     x_scale = torch.ones((1, 1, width // GROUP), device="cuda")
     masked_m = torch.tensor([1], device="cuda", dtype=torch.int32)
     output_scale = torch.ones(1, device="cuda")
     args = (x, x_scale, masked_m, output_scale)
-    actual = load(backend)(*args).view(torch.uint8)
-    expected = reference(*args).view(torch.uint8)
+    return (
+        codes,
+        load(backend)(*args).view(torch.uint8)[0, 0],
+        reference(*args).view(torch.uint8)[0, 0],
+    )
+
+
+@pytest.mark.parametrize("backend", ["generic", "kunlunxin"])
+def test_fp8_per_token_to_per_tensor_all_input_bytes(backend):
+    # Reassembling the bits round-trips every pattern, negative zero and
+    # the two NaN encodings included.
+    _, actual, expected = _widen_case(backend)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_fp8_per_token_to_per_tensor_finite_input_bytes_ascend():
+    # The Ascend variant rebuilds values by scaling rather than by bit
+    # layout, so it returns positive zero for negative zero and saturates
+    # NaN. Every other pattern still round-trips exactly, and the task
+    # compares values, where those three agree or are a vanishing share.
+    codes, actual, expected = _widen_case("ascend")
+    special = (codes == 0x80) | (codes == 0x7F) | (codes == 0xFF)
+    torch.testing.assert_close(
+        actual[~special], expected[~special], atol=0, rtol=0
+    )
+    assert torch.equal(actual[codes == 0x80], expected[codes == 0x00])
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

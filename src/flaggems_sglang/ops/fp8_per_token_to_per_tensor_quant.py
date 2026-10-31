@@ -79,8 +79,10 @@ def _requantize(
     scale = tl.load(
         S + expert * SE + token * ST + group, group < BLOCK, other=0.0
     )
-    scale = scale * (1.0 / tl.load(OS))
-    value = tl.reshape(_decode_fp8(byte), (TILE, SPAN)) * scale[:, None]
+    inverse = 1.0 / tl.load(OS)
+    value = (
+        tl.reshape(_decode_fp8(byte), (TILE, SPAN)) * scale[:, None] * inverse
+    )
     tl.store(out, _encode_fp8(tl.reshape(value, (TILE * SPAN,))), live)
 
 

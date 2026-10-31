@@ -8,6 +8,9 @@ import triton.language as tl
 __all__ = ["fp8_per_token_to_per_tensor_quant"]
 
 GROUP = 128
+# The XPU scratchpad rejects the generic kernel's 1024-element tile, so a
+# tile holds one scale group and the scale repeats across it by gather.
+BLOCK = 128
 
 
 @triton.jit
@@ -47,6 +50,7 @@ def _requantize(
     OS,
     Y,
     T: tl.constexpr,
+    K: tl.constexpr,
     XE: tl.constexpr,
     XT: tl.constexpr,
     SE: tl.constexpr,
@@ -54,27 +58,22 @@ def _requantize(
     YE: tl.constexpr,
     YT: tl.constexpr,
     SPAN: tl.constexpr,
-    BLOCKS: tl.constexpr,
+    TILE: tl.constexpr,
 ):
     row = tl.program_id(0)
     expert = row // T
     token = row % T
-    # Walking one scale group per step keeps each tile inside the vendor
-    # scratchpad and the group scale a scalar, so no index arithmetic has
-    # to divide a vector.
+    column = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    live = column < K
     kept = token < tl.load(M + expert)
-    inverse = 1.0 / tl.load(OS)
-    column = tl.arange(0, SPAN)
-    source = X + expert * XE + token * XT
-    scales = S + expert * SE + token * ST
-    target = Y + expert * YE + token * YT
-    for group in range(BLOCKS):
-        byte = tl.load(source + group * SPAN + column, kept, other=0)
-        scale = tl.load(scales + group) * inverse
-        # Masked rows read zero, and zero survives the round trip, so they
-        # store their zero bytes without a separate branch.
-        value = _decode_fp8(byte) * scale
-        tl.store(target + group * SPAN + column, _encode_fp8(value))
+    byte = tl.load(X + expert * XE + token * XT + column, live & kept, other=0)
+    scale = tl.load(
+        S + expert * SE + token * ST + column // SPAN, live & kept, other=0.0
+    )
+    # Masked lanes read zero, and zero survives the round trip, so those
+    # rows store their zero bytes without a separate branch.
+    value = _decode_fp8(byte) * scale * (1.0 / tl.load(OS))
+    tl.store(Y + expert * YE + token * YT + column, _encode_fp8(value), live)
 
 
 def fp8_per_token_to_per_tensor_quant(x, x_scale, masked_m, output_scale):
@@ -87,13 +86,14 @@ def fp8_per_token_to_per_tensor_quant(x, x_scale, masked_m, output_scale):
     if masked_m.shape != (experts,):
         raise ValueError("masked_m must hold one row count per expert")
     out = torch.empty_like(x)
-    _requantize[(experts * tokens,)](
+    _requantize[(experts * tokens, triton.cdiv(width, BLOCK))](
         x.view(torch.uint8),
         x_scale,
         masked_m,
         output_scale,
         out.view(torch.uint8),
         tokens,
+        width,
         x.stride(0),
         x.stride(1),
         x_scale.stride(0),
@@ -101,7 +101,7 @@ def fp8_per_token_to_per_tensor_quant(x, x_scale, masked_m, output_scale):
         out.stride(0),
         out.stride(1),
         GROUP,
-        width // GROUP,
+        BLOCK,
         num_warps=1,
         num_stages=1,
         enable_fp_fusion=False,

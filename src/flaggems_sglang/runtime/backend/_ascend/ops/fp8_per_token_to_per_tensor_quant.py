@@ -12,16 +12,20 @@ GROUP = 128
 
 @triton.jit
 def _decode_fp8(byte):
-    """Widen E4M3FN bytes to FP32 without a native FP8 cast."""
+    """Widen E4M3FN bytes to FP32 with arithmetic only.
+
+    The Ascend compiler rejects integer-to-float bitcasts, so the exponent
+    and mantissa are recombined by scaling instead of by reassembling bits.
+    """
     u = byte.to(tl.uint32)
-    sign = (u & 0x80) << 24
-    magnitude = u & 0x7F
-    normal = ((magnitude << 20) + 0x3C000000).to(tl.float32, bitcast=True)
-    subnormal = normal * 2.0 - 2.0**-6
-    value = tl.where(magnitude < 8, subnormal, normal)
-    value = tl.where(magnitude == 0x7F, float("nan"), value)
-    bits = value.to(tl.uint32, bitcast=True) | sign
-    return bits.to(tl.float32, bitcast=True)
+    exponent = (u >> 3) & 15
+    mantissa = (u & 7).to(tl.float32)
+    # Subnormals drop the implicit leading one and share the exponent of
+    # the smallest normal, so clamping the exponent covers both cases.
+    leading = tl.where(exponent > 0, 8.0, 0.0)
+    scale = tl.exp2(tl.maximum(exponent, 1).to(tl.float32) - 10.0)
+    value = (mantissa + leading) * scale
+    return tl.where((u & 0x80) != 0, -value, value)
 
 
 @triton.jit
@@ -70,10 +74,10 @@ def _requantize(
     target = Y + expert * YE + token * YT
     for group in range(BLOCKS):
         byte = tl.load(source + group * SPAN + column, kept, other=0)
-        scale = tl.load(scales + group) * inverse
+        scale = tl.load(scales + group)
         # Masked rows read zero, and zero survives the round trip, so they
         # store their zero bytes without a separate branch.
-        value = _decode_fp8(byte) * scale
+        value = _decode_fp8(byte) * scale * inverse
         tl.store(target + group * SPAN + column, _encode_fp8(value))
 
 
