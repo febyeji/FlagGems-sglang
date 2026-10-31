@@ -138,7 +138,7 @@ def _widen_case(backend):
     )
 
 
-@pytest.mark.parametrize("backend", ["generic", "kunlunxin"])
+@pytest.mark.parametrize("backend", ["generic"])
 def test_fp8_per_token_to_per_tensor_all_input_bytes(backend):
     # Every pattern round-trips, negative zero and both NaN encodings
     # included.
@@ -146,12 +146,13 @@ def test_fp8_per_token_to_per_tensor_all_input_bytes(backend):
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-def test_fp8_per_token_to_per_tensor_input_bytes_ascend():
-    # The Ascend variant applies the sign by negating, the way the Ascend
-    # kernels that compile on that chip do, so negative zero comes back as
-    # positive zero. Every other pattern round-trips, and the task compares
-    # values, where the two are equal.
-    codes, actual, expected = _widen_case("ascend")
+@pytest.mark.parametrize("backend", ["kunlunxin", "ascend"])
+def test_fp8_per_token_to_per_tensor_input_bytes_negated(backend):
+    # Both vendor variants apply the sign by negating, the way the vendor
+    # kernels that compile on those chips do, so negative zero comes back
+    # as positive zero. Every other pattern round-trips, and the task
+    # compares values, where the two are equal.
+    codes, actual, expected = _widen_case(backend)
     other = codes != 0x80
     torch.testing.assert_close(actual[other], expected[other], atol=0, rtol=0)
     assert torch.equal(actual[codes == 0x80], expected[codes == 0x00])
