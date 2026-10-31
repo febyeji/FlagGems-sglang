@@ -42,15 +42,21 @@ def _widen_table(device):
 
 @triton.jit
 def _encode_fp8(value):
-    """Round to E4M3FN, matching torch's round-to-nearest-even cast."""
-    bits = value.to(tl.uint32, bitcast=True)
+    """Round to E4M3FN, matching torch's round-to-nearest-even cast.
+
+    Every integer here is signed. The batch-11 Ascend kernel that scores on
+    this chip is the generic one with each unsigned word replaced by a
+    signed one, and the magnitude stays non-negative, so the arithmetic
+    shifts behave like logical ones.
+    """
+    bits = value.to(tl.int32, bitcast=True)
     sign = (bits >> 24) & 128
     nan = (bits & 0x7FFFFFFF) > 0x7F800000
     magnitude = tl.minimum(tl.abs(value), 448.0)
-    u = magnitude.to(tl.uint32, bitcast=True)
+    u = magnitude.to(tl.int32, bitcast=True)
     rounded = u + 0x7FFFF + ((u >> 20) & 1)
     normal = (rounded >> 20) - (120 << 3)
-    subnormal = (magnitude + 16384.0).to(tl.uint32, bitcast=True) - 0x46800000
+    subnormal = (magnitude + 16384.0).to(tl.int32, bitcast=True) - 0x46800000
     encoded = tl.where(magnitude < 2.0**-6, subnormal, normal)
     return tl.where(nan, 127, sign | encoded)
 
