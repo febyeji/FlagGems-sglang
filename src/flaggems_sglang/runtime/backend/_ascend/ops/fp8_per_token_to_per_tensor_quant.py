@@ -8,7 +8,8 @@ import triton.language as tl
 __all__ = ["fp8_per_token_to_per_tensor_quant"]
 
 GROUP = 128
-BLOCK = 512
+PACK = 4
+BLOCK = 128
 _WIDEN = {}
 
 
@@ -51,7 +52,13 @@ def _encode_fp8(value):
     normal = (rounded >> 20) - (120 << 3)
     subnormal = (magnitude + 16384.0).to(tl.uint32, bitcast=True) - 0x46800000
     encoded = tl.where(magnitude < 2.0**-6, subnormal, normal)
-    return tl.where(nan, 127, sign | encoded).to(tl.uint8)
+    return tl.where(nan, 127, sign | encoded)
+
+
+@triton.jit
+def _lane(word, shift: tl.constexpr, W, scale):
+    code = ((word >> shift) & 0xFF).to(tl.int32)
+    return _encode_fp8(tl.load(W + code) * scale) << shift
 
 
 @triton.jit
@@ -62,37 +69,44 @@ def _requantize(
     OS,
     W,
     Y,
+    TILES: tl.constexpr,
     T: tl.constexpr,
-    K: tl.constexpr,
+    WORDS: tl.constexpr,
     XE: tl.constexpr,
     XT: tl.constexpr,
     SE: tl.constexpr,
     ST: tl.constexpr,
     YE: tl.constexpr,
     YT: tl.constexpr,
-    SPAN: tl.constexpr,
+    PER: tl.constexpr,
     TILE: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    # Four E4M3FN codes travel as one 32-bit word, so the kernel issues no
+    # 8-bit load; a 1-D grid keeps every row index scalar.
+    pid = tl.program_id(0)
+    row = pid // TILES
     expert = row // T
     token = row % T
-    column = tl.program_id(1) * TILE + tl.arange(0, TILE)
-    live = column < K
-    # The row count and the per-tensor scale are read as lane-wide vectors.
-    # Reading either as a scalar is the one construct this compiler has
-    # rejected through every shape of this kernel.
+    index = (pid % TILES) * TILE + tl.arange(0, TILE)
+    live = index < WORDS
     lane = tl.zeros((TILE,), tl.int32)
     rows = tl.load(M + (lane + expert))
     inverse = 1.0 / tl.load(OS + lane)
     kept = live & (token < rows)
-    byte = tl.load(X + expert * XE + token * XT + column, kept, other=0)
+    word = tl.load(X + expert * XE + token * XT + index, kept, other=0)
     scale = tl.load(
-        S + expert * SE + token * ST + column // SPAN, kept, other=0.0
+        S + expert * SE + token * ST + index // PER, kept, other=0.0
     )
     # Masked lanes read code zero, which widens to zero and encodes back to
     # zero, so those rows store their zero bytes without a separate branch.
-    value = tl.load(W + byte.to(tl.int32)) * scale * inverse
-    tl.store(Y + expert * YE + token * YT + column, _encode_fp8(value), live)
+    scale = scale * inverse
+    packed = (
+        _lane(word, 0, W, scale)
+        | _lane(word, 8, W, scale)
+        | _lane(word, 16, W, scale)
+        | _lane(word, 24, W, scale)
+    )
+    tl.store(Y + expert * YE + token * YT + index, packed, live)
 
 
 def fp8_per_token_to_per_tensor_quant(x, x_scale, masked_m, output_scale):
@@ -105,22 +119,29 @@ def fp8_per_token_to_per_tensor_quant(x, x_scale, masked_m, output_scale):
     if masked_m.shape != (experts,):
         raise ValueError("masked_m must hold one row count per expert")
     out = torch.empty_like(x)
-    _requantize[(experts * tokens, triton.cdiv(width, BLOCK))](
-        x.view(torch.uint8),
+    bytes_in = x.view(torch.uint8)
+    bytes_out = out.view(torch.uint8)
+    if bytes_in.stride(0) % PACK or bytes_in.stride(1) % PACK:
+        raise ValueError("rows must start on a 4-byte boundary")
+    words = width // PACK
+    tiles = triton.cdiv(words, BLOCK)
+    _requantize[(experts * tokens * tiles,)](
+        bytes_in.view(torch.int32),
         x_scale,
         masked_m,
         output_scale,
         _widen_table(x.device),
-        out.view(torch.uint8),
+        bytes_out.view(torch.int32),
+        tiles,
         tokens,
-        width,
-        x.stride(0),
-        x.stride(1),
+        words,
+        bytes_in.stride(0) // PACK,
+        bytes_in.stride(1) // PACK,
         x_scale.stride(0),
         x_scale.stride(1),
-        out.stride(0),
-        out.stride(1),
-        GROUP,
+        bytes_out.stride(0) // PACK,
+        bytes_out.stride(1) // PACK,
+        GROUP // PACK,
         BLOCK,
         num_warps=4,
         num_stages=1,
