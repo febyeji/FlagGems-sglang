@@ -8,24 +8,35 @@ import triton.language as tl
 __all__ = ["fp8_per_token_to_per_tensor_quant"]
 
 GROUP = 128
+BLOCK = 512
+_WIDEN = {}
 
 
-@triton.jit
-def _decode_fp8(byte):
-    """Widen E4M3FN bytes to FP32 with arithmetic only.
+def _widen_table(device):
+    """One FP32 value per E4M3FN code, laid out by code.
 
-    The Ascend compiler rejects integer-to-float bitcasts, so the exponent
-    and mantissa are recombined by scaling instead of by reassembling bits.
+    The Ascend compiler rejects the bit arithmetic that widens FP8 inline,
+    so the kernel reads the value from this constant instead. The entries
+    come from the format definition: a 4-bit exponent biased by 7, a 3-bit
+    mantissa, no implicit leading one below the smallest normal, and the
+    all-ones pattern reserved for NaN.
     """
-    u = byte.to(tl.uint32)
-    exponent = (u >> 3) & 15
-    mantissa = (u & 7).to(tl.float32)
-    # Subnormals drop the implicit leading one and share the exponent of
-    # the smallest normal, so clamping the exponent covers both cases.
-    leading = tl.where(exponent > 0, 8.0, 0.0)
-    scale = tl.exp2(tl.maximum(exponent, 1).to(tl.float32) - 10.0)
-    value = (mantissa + leading) * scale
-    return tl.where((u & 0x80) != 0, -value, value)
+    cached = _WIDEN.get(device)
+    if cached is None:
+        values = []
+        for code in range(256):
+            exponent = (code >> 3) & 15
+            mantissa = code & 7
+            if exponent == 15 and mantissa == 7:
+                value = float("nan")
+            elif exponent == 0:
+                value = mantissa * 2.0**-9
+            else:
+                value = (8 + mantissa) * 2.0 ** (exponent - 10)
+            values.append(-value if code >> 7 else value)
+        cached = torch.tensor(values, dtype=torch.float32, device=device)
+        _WIDEN[device] = cached
+    return cached
 
 
 @triton.jit
@@ -49,8 +60,10 @@ def _requantize(
     S,
     M,
     OS,
+    W,
     Y,
     T: tl.constexpr,
+    K: tl.constexpr,
     XE: tl.constexpr,
     XT: tl.constexpr,
     SE: tl.constexpr,
@@ -58,27 +71,22 @@ def _requantize(
     YE: tl.constexpr,
     YT: tl.constexpr,
     SPAN: tl.constexpr,
-    BLOCKS: tl.constexpr,
+    TILE: tl.constexpr,
 ):
     row = tl.program_id(0)
     expert = row // T
     token = row % T
-    # Walking one scale group per step keeps each tile inside the vendor
-    # scratchpad and the group scale a scalar, so no index arithmetic has
-    # to divide a vector.
-    kept = token < tl.load(M + expert)
-    inverse = 1.0 / tl.load(OS)
-    column = tl.arange(0, SPAN)
-    source = X + expert * XE + token * XT
-    scales = S + expert * SE + token * ST
-    target = Y + expert * YE + token * YT
-    for group in range(BLOCKS):
-        byte = tl.load(source + group * SPAN + column, kept, other=0)
-        scale = tl.load(scales + group)
-        # Masked rows read zero, and zero survives the round trip, so they
-        # store their zero bytes without a separate branch.
-        value = _decode_fp8(byte) * scale * inverse
-        tl.store(target + group * SPAN + column, _encode_fp8(value))
+    column = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    live = column < K
+    kept = live & (token < tl.load(M + expert))
+    byte = tl.load(X + expert * XE + token * XT + column, kept, other=0)
+    scale = tl.load(
+        S + expert * SE + token * ST + column // SPAN, kept, other=0.0
+    )
+    # Masked lanes read code zero, which widens to zero and encodes back to
+    # zero, so those rows store their zero bytes without a separate branch.
+    value = tl.load(W + byte.to(tl.int32)) * scale * (1.0 / tl.load(OS))
+    tl.store(Y + expert * YE + token * YT + column, _encode_fp8(value), live)
 
 
 def fp8_per_token_to_per_tensor_quant(x, x_scale, masked_m, output_scale):
@@ -91,13 +99,15 @@ def fp8_per_token_to_per_tensor_quant(x, x_scale, masked_m, output_scale):
     if masked_m.shape != (experts,):
         raise ValueError("masked_m must hold one row count per expert")
     out = torch.empty_like(x)
-    _requantize[(experts * tokens,)](
+    _requantize[(experts * tokens, triton.cdiv(width, BLOCK))](
         x.view(torch.uint8),
         x_scale,
         masked_m,
         output_scale,
+        _widen_table(x.device),
         out.view(torch.uint8),
         tokens,
+        width,
         x.stride(0),
         x.stride(1),
         x_scale.stride(0),
@@ -105,7 +115,7 @@ def fp8_per_token_to_per_tensor_quant(x, x_scale, masked_m, output_scale):
         out.stride(0),
         out.stride(1),
         GROUP,
-        width // GROUP,
+        BLOCK,
         num_warps=4,
         num_stages=1,
         enable_fp_fusion=False,
