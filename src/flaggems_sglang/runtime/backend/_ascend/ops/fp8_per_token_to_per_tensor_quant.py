@@ -75,8 +75,6 @@ def _requantize(
     OS,
     W,
     Y,
-    TILES: tl.constexpr,
-    T: tl.constexpr,
     WORDS: tl.constexpr,
     XE: tl.constexpr,
     XT: tl.constexpr,
@@ -84,16 +82,15 @@ def _requantize(
     ST: tl.constexpr,
     YE: tl.constexpr,
     YT: tl.constexpr,
-    PER: tl.constexpr,
+    SHIFT: tl.constexpr,
     TILE: tl.constexpr,
 ):
     # Four E4M3FN codes travel as one 32-bit word, so the kernel issues no
-    # 8-bit load; a 1-D grid keeps every row index scalar.
-    pid = tl.program_id(0)
-    row = pid // TILES
-    expert = row // T
-    token = row % T
-    index = (pid % TILES) * TILE + tl.arange(0, TILE)
+    # 8-bit load, and a grid axis per expert, token and tile means no index
+    # is ever divided.
+    expert = tl.program_id(0)
+    token = tl.program_id(1)
+    index = tl.program_id(2) * TILE + tl.arange(0, TILE)
     live = index < WORDS
     lane = tl.zeros((TILE,), tl.int32)
     rows = tl.load(M + (lane + expert))
@@ -101,7 +98,7 @@ def _requantize(
     kept = live & (token < rows)
     word = tl.load(X + expert * XE + token * XT + index, kept, other=0)
     scale = tl.load(
-        S + expert * SE + token * ST + index // PER, kept, other=0.0
+        S + expert * SE + token * ST + (index >> SHIFT), kept, other=0.0
     )
     # Masked lanes read code zero, which widens to zero and encodes back to
     # zero, so those rows store their zero bytes without a separate branch.
@@ -131,15 +128,13 @@ def fp8_per_token_to_per_tensor_quant(x, x_scale, masked_m, output_scale):
         raise ValueError("rows must start on a 4-byte boundary")
     words = width // PACK
     tiles = triton.cdiv(words, BLOCK)
-    _requantize[(experts * tokens * tiles,)](
+    _requantize[(experts, tokens, tiles)](
         bytes_in.view(torch.int32),
         x_scale,
         masked_m,
         output_scale,
         _widen_table(x.device),
         bytes_out.view(torch.int32),
-        tiles,
-        tokens,
         words,
         bytes_in.stride(0) // PACK,
         bytes_in.stride(1) // PACK,
@@ -147,7 +142,7 @@ def fp8_per_token_to_per_tensor_quant(x, x_scale, masked_m, output_scale):
         x_scale.stride(1),
         bytes_out.stride(0) // PACK,
         bytes_out.stride(1) // PACK,
-        GROUP // PACK,
+        (GROUP // PACK).bit_length() - 1,
         BLOCK,
         num_warps=4,
         num_stages=1,
