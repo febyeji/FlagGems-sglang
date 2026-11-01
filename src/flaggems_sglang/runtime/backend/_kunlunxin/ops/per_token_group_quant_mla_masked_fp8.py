@@ -11,15 +11,20 @@ __all__ = ["per_token_group_quant_mla_masked_fp8"]
 ALIGN = 256
 # Elements per program, measured on the chip against the SGLang baseline:
 #
-#   128 (1 group),  1 warp, separable index   0.073x
-#   1024 (8 rows),  1 warp, separable index   0.581x
-#   1024 (8 groups),1 warp, 2-D index         invalid_correctness (59491)
-#   4096 (32 rows), 1 warp, separable index   invalid_correctness (59501)
-#   4096 (32 rows), 4 warps, separable index  invalid_correctness (59483)
+#    128 (1 group),   1 warp,  separable  0.073x
+#   1024 (8 rows),    1 warp,  separable  0.581x
+#   1024 (8 rows),    1 warp,  separable  0.582x  grid-stride (59513)
+#   1024 (8 groups),  1 warp,  2-D index  invalid_correctness (59491)
+#   2048 (16 rows),   1 warp,  separable  invalid_correctness (59520)
+#   4096 (32 rows),   1 warp,  separable  invalid_correctness (59501)
+#   4096 (32 rows),   4 warps, separable  invalid_correctness (59483)
 #
-# So the chip wants work per program but rejects a tile this size, and the
-# warp count is not what decides it. 1024 is the most work it takes, and
-# the index has to stay separable.
+# Eight times the work per program bought eight times the speedup, but
+# the grid-stride loop, which cuts programs eightfold while running the
+# same number of tile iterations, changed nothing. So the chip charges
+# per tile iteration, not per program, and only a wider tile cuts them.
+# It refuses every width above 1024, with one warp and with four, so
+# 1024 with a separable index is where this kernel stops here.
 TILE = 1024
 
 
