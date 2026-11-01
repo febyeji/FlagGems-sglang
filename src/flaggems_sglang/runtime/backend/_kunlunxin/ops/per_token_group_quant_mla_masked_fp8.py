@@ -9,11 +9,17 @@ __all__ = ["per_token_group_quant_mla_masked_fp8"]
 
 # 256 is the largest block_m the DeepGEMM masked kernel reads.
 ALIGN = 256
-# Elements per program. The XPU scratchpad rejects wide tiles, so the tile
-# stays narrow and the grid stays large. 4096 elements with four warps
-# graded invalid_correctness on this chip (submission 59483) even though
-# the vendor's own XPU group-quant kernel allows 8192 for its contiguous
-# tiles; this one is strided across rows, so it does not get that far.
+# Elements per program, measured on the chip against the SGLang baseline:
+#
+#   128 (1 group),  1 warp, separable index   0.073x
+#   1024 (8 rows),  1 warp, separable index   0.581x
+#   1024 (8 groups),1 warp, 2-D index         invalid_correctness (59491)
+#   4096 (32 rows), 1 warp, separable index   invalid_correctness (59501)
+#   4096 (32 rows), 4 warps, separable index  invalid_correctness (59483)
+#
+# So the chip wants work per program but rejects a tile this size, and the
+# warp count is not what decides it. 1024 is the most work it takes, and
+# the index has to stay separable.
 TILE = 1024
 
 
