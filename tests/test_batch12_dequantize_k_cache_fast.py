@@ -20,9 +20,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 OPERATOR = "dequantize_k_cache_fast"
-# Kunlunxin has no variant of its own: it took the generic file whole,
-# and the one warp its own file asked for was what made it fail.
-BACKENDS = ["generic", "ascend"]
+BACKENDS = ["generic", "kunlunxin", "ascend"]
 NOPE_DIM = 512
 ROPE_DIM = 64
 
