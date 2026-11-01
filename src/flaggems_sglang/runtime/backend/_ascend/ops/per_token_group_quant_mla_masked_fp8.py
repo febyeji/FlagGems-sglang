@@ -81,7 +81,11 @@ def _quantize(
             tl.full([ROWS], M, tl.int32),
             (index < TOTAL) & (rest == 0) & (lane == 0),
         )
-        valid = live[:, None] & (column < K)[None, :]
+        # BLOCK rounds GROUP up to a power of two, so the lanes past
+        # the end of the group belong to the next one and stay out of
+        # both the reduction and the store.
+        inside = (span < GROUP) & (column < K)
+        valid = live[:, None] & inside[None, :]
         value = tl.load(
             X + batch * XB + row[:, None] * XR + column[None, :] * XC,
             valid,

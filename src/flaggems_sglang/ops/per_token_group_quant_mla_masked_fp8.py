@@ -79,7 +79,8 @@ def _quantize(
     block = rest // TILES
     lane = tl.arange(0, ROWS)
     row = block * ROWS + lane
-    column = tile * GROUP + tl.arange(0, BLOCK)
+    span = tl.arange(0, BLOCK)
+    column = tile * GROUP + span
     live = row < M
     # Every batch holds the same row count, so the batch's first program
     # writes it here rather than paying for a second launch.
@@ -88,7 +89,11 @@ def _quantize(
         tl.full([ROWS], M, tl.int32),
         (rest == 0) & (lane == 0),
     )
-    valid = live[:, None] & (column < K)[None, :]
+    # BLOCK rounds GROUP up to a power of two, so the lanes past the end
+    # of the group belong to the next one and stay out of both the
+    # reduction and the store.
+    inside = (span < GROUP) & (column < K)
+    valid = live[:, None] & inside[None, :]
     value = _load(
         X + batch * XB + row[:, None] * XR + column[None, :] * XC, valid
     )

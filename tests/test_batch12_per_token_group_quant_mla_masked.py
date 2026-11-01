@@ -118,6 +118,17 @@ def test_mla_masked_group_sizes(backend, group_size):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("group_size,k", [(96, 576), (192, 768), (48, 480)])
+def test_mla_masked_group_size_not_a_power_of_two(backend, group_size, k):
+    # The tile width rounds the group up to a power of two, so the lanes
+    # past the end of the group belong to the next one. Letting them in
+    # corrupts the absmax and the scale.
+    x = make(2, 40, k, seed=group_size)
+    args = (x, group_size, 1e-12)
+    assert_matches(load(backend)(*args), reference(*args))
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mla_masked_dtypes(backend, dtype):
     x = make(2, 48, 512, dtype=dtype, seed=7)
