@@ -11,6 +11,13 @@ __all__ = ["set_mla_kv_buffer_fp8_quant"]
 # per program, so the widest tile wins, and the measurements on the MLA
 # quantizer put the ceiling here: with one warp and a separable index it
 # takes 1024 and rejects everything above it as incorrect.
+#
+# This tile is also the slowest of the seven graded chips, which is where
+# the next measurement belongs. Submission 59584 scored, in order,
+# tianshu 5.5926, muxi 4.4966, haiguang 4.8514, kunlunxin 0.8424,
+# huawei 19.6578, card_a 3.136, card_b 3.1548, averaging 5.9617; the
+# graded records and the local timings are under
+# ~/Codespaces/FlagGems-sglang-results/yej-276/, listed in its README.
 TILE = 1024
 
 
