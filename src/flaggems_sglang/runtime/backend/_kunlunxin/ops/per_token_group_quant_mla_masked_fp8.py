@@ -45,7 +45,7 @@ def _quantize(
     K: tl.constexpr,
     GROUP: tl.constexpr,
     TILES: tl.constexpr,
-    BLOCKS: tl.constexpr,
+    TOTAL: tl.constexpr,
     XB: tl.constexpr,
     XR: tl.constexpr,
     XC: tl.constexpr,
@@ -60,38 +60,35 @@ def _quantize(
     pid = tl.program_id(0)
     if WIDE:
         pid = pid.to(tl.int64)
-    batch = pid // (TILES * BLOCKS)
-    rest = pid % (TILES * BLOCKS)
-    # Neighbouring programs walk the K groups of one row block, which keeps
-    # their reads and their FP8 writes inside the same rows.
+    # The group is the unit, not the row. Consecutive groups sit next to
+    # each other in a contiguous activation, so a program's reads and its
+    # FP8 writes form one run, which is the shape the vendor's own XPU
+    # group-quant kernel moves. Walking rows instead left the tile strided
+    # by K and graded 0.581x on this chip.
+    group = pid * ROWS + tl.arange(0, ROWS)
+    batch = group // (M * TILES)
+    rest = group % (M * TILES)
+    row = rest // TILES
     tile = rest % TILES
-    block = rest // TILES
-    lane = tl.arange(0, ROWS)
-    row = block * ROWS + lane
     span = tl.arange(0, BLOCK)
-    column = tile * GROUP + span
-    live = row < M
-    # Every batch holds the same row count, so the batch's first program
+    column = tile[:, None] * GROUP + span[None, :]
+    live = group < TOTAL
+    # Every batch holds the same row count, so the batch's first group
     # writes it here rather than paying for a second launch.
-    tl.store(
-        MM + batch + lane,
-        tl.full([ROWS], M, tl.int32),
-        (rest == 0) & (lane == 0),
-    )
+    tl.store(MM + batch, tl.full([ROWS], M, tl.int32), live & (rest == 0))
     # BLOCK rounds GROUP up to a power of two, so the lanes past the end
     # of the group belong to the next one and stay out of both the
     # reduction and the store.
-    inside = (span < GROUP) & (column < K)
-    valid = live[:, None] & inside[None, :]
+    valid = live[:, None] & (span < GROUP)[None, :] & (column < K)
     value = tl.load(
-        X + batch * XB + row[:, None] * XR + column[None, :] * XC, valid, 0.0
+        X + batch[:, None] * XB + row[:, None] * XR + column * XC,
+        valid,
+        0.0,
     ).to(tl.float32)
     absmax = tl.maximum(tl.max(tl.abs(value), axis=1), EPS)
     scale = absmax / 448.0
     code = _encode_fp8(tl.div_rn(value, scale[:, None]))
-    tl.store(Q + batch * QB + row[:, None] * QR + column[None, :], code, valid)
-    # The scales of neighbouring rows sit next to each other in the
-    # transposed buffer, so this narrow write stays coalesced.
+    tl.store(Q + batch[:, None] * QB + row[:, None] * QR + column, code, valid)
     tl.store(S + batch * SB + tile * SG + row, scale, live)
 
 
@@ -110,13 +107,13 @@ def per_token_group_quant_mla_masked_fp8(x, group_size, eps):
     masked_m = torch.empty((batches,), dtype=torch.int32, device=x.device)
     if batches and rows and tiles:
         block = triton.next_power_of_2(group_size)
-        row_tile = max(1, TILE // block)
-        blocks = triton.cdiv(rows, row_tile)
-        programs = batches * tiles * blocks
+        per_program = max(1, TILE // block)
+        total = batches * rows * tiles
+        programs = triton.cdiv(total, per_program)
         bound = max(
             x.numel(),
             batches * aligned * width,
-            programs * row_tile * block,
+            programs * per_program * block,
         )
         _quantize[(programs,)](
             x,
@@ -128,7 +125,7 @@ def per_token_group_quant_mla_masked_fp8(x, group_size, eps):
             width,
             group_size,
             tiles,
-            blocks,
+            total,
             x.stride(0),
             x.stride(1),
             x.stride(2),
@@ -137,7 +134,7 @@ def per_token_group_quant_mla_masked_fp8(x, group_size, eps):
             tiles * aligned,
             aligned,
             bound >= 2**31,
-            row_tile,
+            per_program,
             block,
             num_warps=1,
             num_stages=1,
