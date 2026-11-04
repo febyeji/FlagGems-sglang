@@ -59,34 +59,38 @@ def _dequantize(
     ROPE_OFF: tl.constexpr,
     GROUP: tl.constexpr,
     TILES: tl.constexpr,
+    NOPE_W: tl.constexpr,
     ROPE_W: tl.constexpr,
     GRID: tl.constexpr,
     CHUNKS: tl.constexpr,
 ):
-    tile = tl.arange(0, TILES)
-    column = tl.arange(0, GROUP)
-    # A tile per row of the block, which gives each one its own scale
-    # without gathering it per channel.
-    offset = tile[:, None] * GROUP + column[None, :]
+    column = tl.arange(0, NOPE_W)
     tail = tl.arange(0, ROPE_W)
-    inside = offset < TILES * GROUP
-    tile_inside = tile < TILES
+    # The masks carry the shape of what they guard, which is the form this
+    # chip's compiler takes.
+    inside = column < NOPE_W
     tail_inside = tail < ROPE_W
     for chunk in range(CHUNKS):
         token = tl.program_id(0) + chunk * GRID
         live = token < rows
-        # The masks carry the shape of what they guard, which is the form
-        # this chip's compiler takes.
         mask = inside & live
-        tile_mask = tile_inside & live
         tail_mask = tail_inside & live
-        byte = tl.load(NOPE + token * NOPE_S0 + offset, mask, 0)
-        scale = tl.load(
-            SCALE + token * SCALE_S0 + SCALE_OFF + tile, tile_mask, 0.0
-        )
+        byte = tl.load(NOPE + token * NOPE_S0 + column, mask, 0)
+        # One scalar load per group, laid over the row by the channel it
+        # starts at. A gather would read the same four values per channel
+        # and this chip pays for a gather.
+        scale = tl.load(SCALE + token * SCALE_S0 + SCALE_OFF, live, 0.0)
+        for group in tl.static_range(1, TILES):
+            scale = tl.where(
+                column < group * GROUP,
+                scale,
+                tl.load(
+                    SCALE + token * SCALE_S0 + SCALE_OFF + group, live, 0.0
+                ),
+            )
         tl.store(
-            OUT + token * OUT_S0 + offset,
-            (_decode(byte) * scale[:, None]).to(tl.bfloat16),
+            OUT + token * OUT_S0 + column,
+            (_decode(byte) * scale).to(tl.bfloat16),
             mask,
         )
         # The rope tail is already BF16 inside the FP8 row, so it is a copy.
@@ -127,6 +131,7 @@ def dequantize_k_cache_fast(quant_k_cache, group_size=128):
             (DIM_NOPE + tiles * 4) // 2,
             group_size,
             tiles,
+            DIM_NOPE,
             DIM_ROPE,
             grid,
             triton.cdiv(rows, grid),

@@ -20,7 +20,14 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 OPERATOR = "dequantize_k_cache_fast"
-BACKENDS = ["generic", "kunlunxin", "ascend"]
+BACKENDS = [
+    "generic",
+    "kunlunxin",
+    "ascend",
+    "metax",
+    "iluvatar",
+    "hygon",
+]
 NOPE_DIM = 512
 ROPE_DIM = 64
 

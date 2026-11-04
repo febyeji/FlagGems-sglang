@@ -11,7 +11,6 @@ __all__ = ["dequantize_k_cache_fast"]
 # FP32 scale per group of them, then 64 rope channels kept in BF16.
 DIM_NOPE = 512
 DIM_ROPE = 64
-WARPS = 4
 
 
 @triton.jit
@@ -40,74 +39,59 @@ def _decode(byte):
 
 
 @triton.jit
-def _dequantize(
-    OUT,
-    NOPE,
-    SCALE,
-    ROPE,
-    OUT_S0: tl.constexpr,
-    NOPE_S0: tl.constexpr,
-    SCALE_S0: tl.constexpr,
-    ROPE_S0: tl.constexpr,
-    SCALE_OFF: tl.constexpr,
-    ROPE_OFF: tl.constexpr,
-    GROUP: tl.constexpr,
-    TILES: tl.constexpr,
-    ROPE_W: tl.constexpr,
-):
-    # One program per row. The row divides into whole tiles and the grid
-    # into whole rows, so every index here is affine and nothing is masked.
+def _dequantize(OUT, ROW, ROW_S0: tl.constexpr, GROUP: tl.constexpr):
+    # One program per row, the whole nope half in one flat tile, and the
+    # scale gathered per channel. The grid divides into whole rows and the
+    # widths are powers of two, so nothing here is masked.
+    #
+    # The row arrives once, as bytes, and the two regions that are
+    # reinterpreted rather than converted are reached by casting that one
+    # pointer. Each argument and each launch option costs a few
+    # microseconds on the way in, which is the scale this operator is
+    # measured at: the kernel runs at the memory's pace and the call
+    # around it does not.
     token = tl.program_id(0)
-    tile = tl.arange(0, TILES)
-    column = tl.arange(0, GROUP)
-    # A tile per row of the block, which gives each one its own scale
-    # without gathering it per channel.
-    offset = tile[:, None] * GROUP + column[None, :]
-    byte = tl.load(NOPE + token * NOPE_S0 + offset)
-    scale = tl.load(SCALE + token * SCALE_S0 + SCALE_OFF + tile)
+    column = tl.arange(0, 512)
+    byte = tl.load(ROW + token * ROW_S0 + column)
+    scale = tl.load(
+        ROW.to(tl.pointer_type(tl.float32))
+        + token * (ROW_S0 // 4)
+        + 128
+        + column // GROUP
+    )
     tl.store(
-        OUT + token * OUT_S0 + offset,
-        (_decode(byte) * scale[:, None]).to(tl.bfloat16),
+        OUT + token * 576 + column, (_decode(byte) * scale).to(tl.bfloat16)
     )
     # The rope tail is already BF16 inside the FP8 row, so it is a copy.
-    tail = tl.arange(0, ROPE_W)
-    rope = tl.load(ROPE + token * ROPE_S0 + ROPE_OFF + tail)
-    tl.store(OUT + token * OUT_S0 + TILES * GROUP + tail, rope)
+    tail = tl.arange(0, 64)
+    rope = tl.load(
+        ROW.to(tl.pointer_type(tl.bfloat16))
+        + token * (ROW_S0 // 2)
+        + (512 + (512 // GROUP) * 4) // 2
+        + tail
+    )
+    tl.store(OUT + token * 576 + 512 + tail, rope)
 
 
 def dequantize_k_cache_fast(quant_k_cache, group_size=128):
     """Unpack an MLA K cache row: scale the nope tiles, copy the rope tail.
 
     The scale and rope regions are reinterpreted rather than converted, so
-    the kernel reads the same rows through an FP32 and a BF16 view beside
-    the byte view it decodes.
+    the kernel reaches them by casting the byte pointer it is handed.
     """
     rows = quant_k_cache.shape[0]
-    tiles = DIM_NOPE // group_size
     out = torch.empty(
-        (rows, DIM_NOPE + DIM_ROPE),
+        rows,
+        DIM_NOPE + DIM_ROPE,
         dtype=torch.bfloat16,
         device=quant_k_cache.device,
     )
     if rows:
-        stride = quant_k_cache.stride(0) * quant_k_cache.element_size()
         _dequantize[(rows,)](
             out,
             triton.reinterpret(quant_k_cache, tl.int8),
-            triton.reinterpret(quant_k_cache, tl.float32),
-            triton.reinterpret(quant_k_cache, tl.bfloat16),
-            out.stride(0),
-            stride,
-            stride // 4,
-            stride // 2,
-            DIM_NOPE // 4,
-            (DIM_NOPE + tiles * 4) // 2,
+            quant_k_cache.stride(0),
             group_size,
-            tiles,
-            DIM_ROPE,
-            num_warps=WARPS,
-            num_stages=1,
-            enable_fp_fusion=False,
         )
     return out
 
