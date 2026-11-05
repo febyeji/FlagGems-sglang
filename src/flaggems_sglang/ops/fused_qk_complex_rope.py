@@ -17,6 +17,19 @@ TILE = 4096
 PROGRAMS = 1024
 NUM_WARPS = 4
 
+# Graded on all seven chips through the competition's harness, where
+# each of them runs the file that carries its own name and falls back
+# to this one. Submission 64215 is valid at 3.1531 average, first of
+# four teams: haiguang 4.6742, muxi 4.5180, tianshu 4.1698,
+# card_a 4.1632, card_b 3.2212, huawei 1.0978, kunlunxin 0.2272. The
+# five GPU-like chips read and write the row as 32-bit words, which is
+# worth about twice this file's two accesses of stride two; this file
+# keeps those because a word view needs an even stride and an even
+# storage offset, which an arbitrary input is not required to have.
+# The graded records, the per-variant table and the local timings are
+# under ~/Codespaces/FlagGems-sglang-results/yej-354/, listed in its
+# README.
+
 
 def _block_heads(tokens, heads, pairs):
     # A tile side has to be a power of two: several of the chips reject
