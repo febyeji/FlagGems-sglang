@@ -181,3 +181,69 @@ def test_fused_qk_complex_rope_extreme_values(backend):
     k[2] = -big
     k[3] = 0.0
     assert_matches(load(backend), (q, k, freqs_cis))
+
+
+def spread(x, filler):
+    """A view of `x` whose last-dim stride is two.
+
+    The gaps hold `filler`, so a kernel that walks the row as if it were
+    contiguous reads those values in place of its own.
+    """
+    wide = torch.empty(
+        *x.shape[:-1], x.shape[-1] * 2, dtype=x.dtype, device=x.device
+    )
+    wide[..., ::2] = x
+    wide[..., 1::2] = filler
+    view = wide[..., ::2]
+    assert view.stride(-1) == 2
+    return view
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype,_tol", TOLERANCE)
+@pytest.mark.parametrize("strided", [False, True])
+def test_fused_qk_complex_rope_strided_frequencies(
+    backend, dtype, _tol, strided
+):
+    # The frequencies may be a slice of a wider table, which leaves
+    # their pairs a stride apart. The task's supported inputs do not
+    # require the table to be contiguous, and a kernel that takes the
+    # real part at twice the pair index reads its neighbour's.
+    q, k, freqs_cis = make((5, 3, 64), dtype=dtype, strided=strided, seed=19)
+    filler = torch.full_like(freqs_cis, 1j)
+    assert_matches(load(backend), (q, k, spread(freqs_cis, filler)))
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype,_tol", TOLERANCE)
+def test_fused_qk_complex_rope_strided_inputs(backend, dtype, _tol):
+    # Q and K may have a last-dim stride of their own, and then the two
+    # elements of a pair are not adjacent: there is no 32-bit word to
+    # read, and the kernel has to walk the row by its stride.
+    q, k, freqs_cis = make((5, 3, 64), dtype=dtype, seed=23)
+    filler_q = torch.full_like(q, 7.0)
+    filler_k = torch.full_like(k, -3.0)
+    assert_matches(
+        load(backend), (spread(q, filler_q), spread(k, filler_k), freqs_cis)
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype,_tol", TOLERANCE)
+def test_fused_qk_complex_rope_odd_storage_offset(backend, dtype, _tol):
+    # A contiguous row that starts at an odd element is still a row of
+    # pairs, but it cannot be viewed as 32-bit words.
+    tokens, heads, dim = 5, 3, 64
+    g = torch.Generator(device="cuda").manual_seed(29)
+    buffer = torch.randn(
+        2 * tokens * heads * dim + 1,
+        generator=g,
+        device="cuda",
+        dtype=torch.float32,
+    ).to(dtype)
+    size = tokens * heads * dim
+    q = buffer[1 : 1 + size].view(tokens, heads, dim)
+    k = buffer[1 + size : 1 + 2 * size].view(tokens, heads, dim)
+    assert q.storage_offset() % 2 == 1 and q.stride(-1) == 1
+    _, _, freqs_cis = make((tokens, heads, dim), dtype=dtype, seed=29)
+    assert_matches(load(backend), (q, k, freqs_cis))
