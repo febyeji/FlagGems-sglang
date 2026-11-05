@@ -557,20 +557,6 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '1.0'
-  - id: dsv3_router_gemm
-    description: |
-      DeepSeek-V3 MoE router projection at decode shapes (num_tokens <= 16).
-      Skinny-M matmul against the expert weight matrix, accumulated in fp32 and written as bf16 or fp32.
-    for:
-      - dsv3_router_gemm
-    labels:
-      - fused
-      - sglang
-      - MoE
-    kind:
-      - NeuralNetwork
-    stages:
-      - stable: '1.0'
   - id: embedding_lora_a
     description: |
       LoRA A-projection over an embedding lookup for segmented multi-adapter batches.
