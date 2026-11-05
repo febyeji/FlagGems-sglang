@@ -125,27 +125,13 @@ def _config(total):
     return block, warps, total % block == 0
 
 
-def bias_gelu_tanh(x, bias):
-    """`gelu((x + bias).to(x.dtype), approximate="tanh")`, as one kernel.
+def _launch(src, row, out, h, total, block, warps, exact, wide):
+    """Enter the kernel.
 
-    `x` is a nonempty contiguous `[..., H]` fp16/bf16 tensor and `bias` is
-    `[H]` of the same dtype and device. The result is a new tensor of the
-    same shape, dtype and device; neither input is written.
+    `triton.cdiv` and `triton.next_power_of_2` are JIT callables that
+    cost about 9 microseconds a call, which is most of the budget of a
+    small shape, so the grid is counted out in plain Python.
     """
-    # `empty_like` of a contiguous source is itself contiguous, which is
-    # what the flat index the kernel walks needs.
-    src = x if x.is_contiguous() else x.contiguous()
-    out = torch.empty_like(src)
-    h = x.shape[-1]
-    total = out.numel()
-    if total == 0 or h == 0:
-        return out
-    row = bias if bias.is_contiguous() else bias.contiguous()
-    block, warps, exact = _config(total)
-    wide = total >= INT32_LIMIT
-    # `triton.cdiv` and `triton.next_power_of_2` are JIT callables that
-    # cost about 9 microseconds a call, which is most of the budget of a
-    # small shape, so the launcher counts in plain Python.
     if exact:
         _bias_gelu_tanh_exact.run(
             src,
@@ -173,6 +159,41 @@ def bias_gelu_tanh(x, bias):
             num_warps=warps,
             num_stages=1,
         )
+
+
+def bias_gelu_tanh(x, bias):
+    """`gelu((x + bias).to(x.dtype), approximate="tanh")`, as one kernel.
+
+    `x` is a nonempty contiguous `[..., H]` fp16/bf16 tensor and `bias` is
+    `[H]` of the same dtype and device. The result is a new tensor of the
+    same shape, dtype and device; neither input is written. The call runs
+    on the inputs' device whichever device is current.
+    """
+    # `empty_like` of a contiguous source is itself contiguous, which is
+    # what the flat index the kernel walks needs.
+    src = x if x.is_contiguous() else x.contiguous()
+    out = torch.empty_like(src)
+    h = x.shape[-1]
+    total = out.numel()
+    if total == 0 or h == 0:
+        return out
+    row = bias if bias.is_contiguous() else bias.contiguous()
+    block, warps, exact = _config(total)
+    wide = total >= INT32_LIMIT
+    # Triton launches on the device that is current and rejects a
+    # pointer it cannot reach from there, so an input that lives
+    # elsewhere has to make its own device current first. Asking costs
+    # about 1.5 microseconds and entering the guard about 2.6, which is
+    # a difference worth having on a path that is nearly all host work,
+    # and `is_cuda` keeps the question off the device object. Every
+    # vendor here reaches torch as `cuda` except Ascend, which reaches
+    # it as `npu`.
+    device_fn = torch.cuda if src.is_cuda else getattr(torch, src.device.type)
+    if device_fn.current_device() == src.get_device():
+        _launch(src, row, out, h, total, block, warps, exact, wide)
+    else:
+        with device_fn.device(src.device):
+            _launch(src, row, out, h, total, block, warps, exact, wide)
     return out
 
 

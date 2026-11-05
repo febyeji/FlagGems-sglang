@@ -100,22 +100,8 @@ def _pick_block(total):
     return block, total % block == 0
 
 
-def bias_gelu_tanh(x, bias):
-    """`gelu((x + bias).to(x.dtype), approximate="tanh")`, as one kernel.
-
-    `x` is a nonempty contiguous `[..., H]` fp16/bf16 tensor and `bias` is
-    `[H]` of the same dtype and device. The result is a new tensor of the
-    same shape, dtype and device; neither input is written.
-    """
-    src = x if x.is_contiguous() else x.contiguous()
-    out = torch.empty_like(src)
-    h = x.shape[-1]
-    total = out.numel()
-    if total == 0 or h == 0:
-        return out
-    row = bias if bias.is_contiguous() else bias.contiguous()
-    block, exact = _pick_block(total)
-    wide = total >= INT32_LIMIT
+def _launch(src, row, out, h, total, block, exact, wide):
+    """Enter the kernel, counting the grid out in plain Python."""
     if exact:
         _bias_gelu_tanh_exact.run(
             src,
@@ -143,6 +129,35 @@ def bias_gelu_tanh(x, bias):
             num_warps=4,
             num_stages=1,
         )
+
+
+def bias_gelu_tanh(x, bias):
+    """`gelu((x + bias).to(x.dtype), approximate="tanh")`, as one kernel.
+
+    `x` is a nonempty contiguous `[..., H]` fp16/bf16 tensor and `bias` is
+    `[H]` of the same dtype and device. The result is a new tensor of the
+    same shape, dtype and device; neither input is written. The call runs
+    on the inputs' device whichever device is current.
+    """
+    src = x if x.is_contiguous() else x.contiguous()
+    out = torch.empty_like(src)
+    h = x.shape[-1]
+    total = out.numel()
+    if total == 0 or h == 0:
+        return out
+    row = bias if bias.is_contiguous() else bias.contiguous()
+    block, exact = _pick_block(total)
+    wide = total >= INT32_LIMIT
+    # Triton launches on the device that is current and rejects a
+    # pointer it cannot reach from there, so an input that lives
+    # elsewhere has to make its own device current first. Asking is
+    # cheaper than guarding, and this backend reaches torch as `cuda`.
+    device_fn = torch.cuda if src.is_cuda else getattr(torch, src.device.type)
+    if device_fn.current_device() == src.get_device():
+        _launch(src, row, out, h, total, block, exact, wide)
+    else:
+        with device_fn.device(src.device):
+            _launch(src, row, out, h, total, block, exact, wide)
     return out
 
 

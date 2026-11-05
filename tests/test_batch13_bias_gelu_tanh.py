@@ -176,6 +176,34 @@ def test_bias_gelu_tanh_extreme_values(backend, dtype, _tol):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype,_tol", TOLERANCE)
+@pytest.mark.parametrize("shape", [(3, 24), (1, 4096)])
+def test_bias_gelu_tanh_on_another_device(backend, dtype, _tol, shape):
+    # Triton launches on the device that is current and rejects a
+    # pointer it cannot reach from there, so inputs that live on another
+    # device have to make their own device current for the launch and
+    # give the current device back afterwards. The two shapes take the
+    # masked and the exact path.
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs a second device to be somewhere else")
+    current = torch.cuda.current_device()
+    other = (current + 1) % torch.cuda.device_count()
+    solution = load(backend)
+    # A device's context is what a launch runs in, and it becomes the
+    # current one when that device is used, so the call below only has
+    # somewhere else to be once this one has run.
+    solution(*make((8, 8), dtype=dtype, seed=1))
+    with torch.cuda.device(other):
+        # `make` builds on the current device, which in here is the one
+        # the call will not be launched from.
+        case = make(shape, dtype=dtype, seed=shape[-1])
+    assert case[0].device.index == other
+    assert torch.cuda.current_device() == current
+    assert_matches(solution, case)
+    assert torch.cuda.current_device() == current
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("scale", [1.0, 8.0, 64.0])
 def test_bias_gelu_tanh_magnitudes(backend, scale):
     # Activations entering a bias-GELU are not all near one, and the

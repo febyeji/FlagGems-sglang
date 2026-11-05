@@ -96,21 +96,13 @@ def _shape(h, m):
     return cols, nc, rows
 
 
-def bias_gelu_tanh(x, bias):
-    """`gelu((x + bias).to(x.dtype), approximate="tanh")`, as one kernel.
+def _launch(src, row, out, total, m, h):
+    """Shape the grid and enter the kernel.
 
-    `x` is a nonempty contiguous `[..., H]` fp16/bf16 tensor and `bias` is
-    `[H]` of the same dtype and device. The result is a new tensor of the
-    same shape, dtype and device; neither input is written.
+    The program count is fixed and the trip count is a compile-time
+    constant, so the kernel's loop unrolls and the grid never depends on
+    a value the host has to divide at launch time.
     """
-    src = x if x.is_contiguous() else x.contiguous()
-    out = torch.empty_like(src)
-    h = x.shape[-1]
-    total = out.numel()
-    if total == 0 or h == 0:
-        return out
-    row = bias if bias.is_contiguous() else bias.contiguous()
-    m = total // h
     cols, nc, rows = _shape(h, m)
     nrb = (m + rows - 1) // rows
     work = nrb * nc
@@ -136,6 +128,33 @@ def bias_gelu_tanh(x, bias):
         num_warps=1,
         num_stages=1,
     )
+
+
+def bias_gelu_tanh(x, bias):
+    """`gelu((x + bias).to(x.dtype), approximate="tanh")`, as one kernel.
+
+    `x` is a nonempty contiguous `[..., H]` fp16/bf16 tensor and `bias` is
+    `[H]` of the same dtype and device. The result is a new tensor of the
+    same shape, dtype and device; neither input is written. The call runs
+    on the inputs' device whichever device is current.
+    """
+    src = x if x.is_contiguous() else x.contiguous()
+    out = torch.empty_like(src)
+    h = x.shape[-1]
+    total = out.numel()
+    if total == 0 or h == 0:
+        return out
+    row = bias if bias.is_contiguous() else bias.contiguous()
+    # Triton launches on the device that is current and rejects a
+    # pointer it cannot reach from there, so an input that lives
+    # elsewhere has to make its own device current first. This backend
+    # reaches torch as `npu`, so the module comes from the tensor.
+    device_fn = torch.cuda if src.is_cuda else getattr(torch, src.device.type)
+    if device_fn.current_device() == src.get_device():
+        _launch(src, row, out, total, total // h, h)
+    else:
+        with device_fn.device(src.device):
+            _launch(src, row, out, total, total // h, h)
     return out
 
 
