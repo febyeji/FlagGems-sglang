@@ -116,45 +116,31 @@ def _reduce(
     tl.store(OUT + x, acc, x < SIZE)
 
 
-def _closest_divisor(chunks, want):
-    best = 1
-    for candidate in range(1, chunks + 1):
-        if chunks % candidate == 0 and abs(candidate - want) < abs(
-            best - want
-        ):
-            best = candidate
-    return best
-
-
-def _plan(num_tokens, num_experts, hidden_dim, out_dtype):
-    """Pick (BN, BK, SPLITS, GROUPS) for one shape and output dtype.
+def _plan(num_experts, hidden_dim):
+    """Pick (BN, BK, SPLITS, GROUPS, STEPS) for one shape.
 
     The weight read is the whole cost and one program per expert tile leaves
-    most of the memory system idle, so the reduction is split until the grid
-    is about 80 programs wide. ``BK * SPLITS * GROUPS`` divides
-    ``hidden_dim``, which keeps the k loop free of masks, and the tile sizes
-    hold the kernel's shared memory under 48 KB so that chips with a 64 KB
-    limit run it.
+    most of the memory system idle, so the reduction splits until the grid
+    is wide: every program takes 512 elements of hidden_dim, which is 112
+    programs for a 7168-wide hidden state and 256 experts.
 
-    An fp32 result is compared against an fp32 matmul of the same inputs at
-    an absolute tolerance of 1e-4, and the drift of a chain of fused
-    multiply-adds grows with its length: 7168 elements in one accumulator
-    drift 4e-4, 128 drift 5e-5, which is what the reference itself drifts.
-    So an fp32 result spreads each program's work over four accumulators of
-    at most 128 elements each. A bf16 result rounds to 8 mantissa bits and
-    takes the single wide accumulator instead.
+    Inside a program those 512 elements go to four accumulators of 128 each
+    rather than one chain of 512, because an fp32 result is compared against
+    an fp32 matmul at an absolute tolerance of 1e-4 and the drift of a chain
+    of fused multiply-adds grows with its length: 7168 elements drift 4e-4,
+    128 drift 5e-5, which is what the reference itself drifts. The same
+    shape is the fastest one measured for a bf16 result too, so both take
+    it.
+
+    A 32-wide expert tile over 64 elements holds the kernel's shared memory
+    well inside the 64 KB that the narrowest of the seven chips offers.
     """
     bn = 32 if num_experts % 32 == 0 else 16
-    tiles = triton.cdiv(num_experts, bn)
-    want = max(1.0, 80 / tiles)
-    if out_dtype == torch.float32:
-        groups = 4 if hidden_dim % 512 == 0 else 1
-        bk = 128 if hidden_dim % (128 * groups) == 0 else 64
-    else:
-        groups = 1
-        bk = 256 if hidden_dim % 256 == 0 else 128
-    chunks = hidden_dim // (bk * groups)
-    return bn, bk, _closest_divisor(chunks, want), groups
+    span = 512
+    while hidden_dim % span and span > 64:
+        span //= 2
+    groups = min(4, span // 64)
+    return bn, 64, hidden_dim // span, groups, span // (64 * groups)
 
 
 def dsv3_router_gemm(hidden_states, router_weights, out_dtype):
@@ -164,9 +150,7 @@ def dsv3_router_gemm(hidden_states, router_weights, out_dtype):
     out = torch.empty(
         (num_tokens, num_experts), dtype=out_dtype, device=device
     )
-    bn, bk, splits, groups = _plan(
-        num_tokens, num_experts, hidden_dim, out_dtype
-    )
+    bn, bk, splits, groups, steps = _plan(num_experts, hidden_dim)
     partial = torch.empty(
         (splits, num_tokens, num_experts), dtype=torch.float32, device=device
     )
@@ -184,7 +168,7 @@ def dsv3_router_gemm(hidden_states, router_weights, out_dtype):
         bk,
         splits,
         groups,
-        hidden_dim // (bk * groups * splits),
+        steps,
         grid=(triton.cdiv(num_experts, bn), splits),
         warmup=False,
         num_warps=4,
