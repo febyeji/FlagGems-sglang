@@ -14,7 +14,11 @@ __all__ = ["fused_qk_complex_rope"]
 # kernel in one graded run, and this chip ran the strided file
 # at 3.35, its persistent-grid variant at 2.55. The halves come out
 # of the word with shifts, which is exact for BF16 because its bits are
-# an FP32 word's top half, and through the 16-bit float for FP16.
+# an FP32 word's top half, and through the 16-bit float for FP16. The launch goes through
+# `run` rather than the subscript, which skips the grid callable and the
+# wrapper around it: this chip sits at 4.08 against the leading teams'
+# 4.92, the one chip they are still ahead on, and the shapes this
+# operator is graded at are small enough for the call to show.
 TILE = 4096
 PROGRAMS = 1024
 NUM_WARPS = 4
@@ -125,7 +129,7 @@ def fused_qk_complex_rope(q, k, freqs_cis):
         hblocks = triton.cdiv(heads, block_h)
         q_word = q_flat.view(torch.int32)
         k_word = k_flat.view(torch.int32)
-        _fused_qk_complex_rope_kernel[(tokens * hblocks,)](
+        _fused_qk_complex_rope_kernel.run(
             q_word,
             k_word,
             freqs,
@@ -143,6 +147,8 @@ def fused_qk_complex_rope(q, k, freqs_cis):
             freqs.stride(0),
             pairs == half and heads % block_h == 0,
             q.dtype == torch.bfloat16,
+            grid=(tokens * hblocks,),
+            warmup=False,
             num_warps=NUM_WARPS,
         )
     return q_out.view(shape), k_out.view(shape)

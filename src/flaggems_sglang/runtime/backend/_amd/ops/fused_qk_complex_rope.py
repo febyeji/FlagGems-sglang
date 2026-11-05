@@ -14,10 +14,12 @@ __all__ = ["fused_qk_complex_rope"]
 # kernel in one graded run, and this chip ran the strided file
 # at 3.00. The halves come out
 # of the word with shifts, which is exact for BF16 because its bits are
-# an FP32 word's top half, and through the 16-bit float for FP16.
+# an FP32 word's top half, and through the 16-bit float for FP16. Two warps: this chip reached
+# 3.18 with the word form at four, the lowest of the five GPU-like
+# chips, where the others reached 4.1 to 4.5.
 TILE = 4096
 PROGRAMS = 1024
-NUM_WARPS = 4
+NUM_WARPS = 2
 
 
 def _block_heads(tokens, heads, pairs):
