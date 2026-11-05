@@ -86,13 +86,13 @@ def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
     # The host side is most of a small call, so it stays in plain Python:
     # triton.next_power_of_2 and triton.cdiv are JIT functions in Triton 3.9
     # and cost about 9 us each, and a complex64 table viewed as float32 is
-    # a cheaper view than view_as_real when its last dimension is dense.
+    # a cheaper view than view_as_real.
     m, d = kv.shape
+    # The kernel indexes the table as interleaved (real, imag) floats, which
+    # needs the complex entries of a row next to each other.
     freqs = (
-        freqs_cis.view(torch.float32)
-        if freqs_cis.stride(-1) == 1
-        else torch.view_as_real(freqs_cis)
-    )
+        freqs_cis if freqs_cis.stride(-1) == 1 else freqs_cis.contiguous()
+    ).view(torch.float32)
     out = torch.empty_like(kv)
     if m:
         r = freqs_cis.shape[-1] * 2

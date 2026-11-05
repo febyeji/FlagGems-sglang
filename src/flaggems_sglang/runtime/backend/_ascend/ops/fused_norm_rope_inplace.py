@@ -31,78 +31,83 @@ def _rows(
     EPS: tl.constexpr,
     HAS_W: tl.constexpr,
     HAS_P: tl.constexpr,
-    B: tl.constexpr,
-    H: tl.constexpr,
+    BH: tl.constexpr,
+    HP: tl.constexpr,
     GRID: tl.constexpr,
     CHUNKS: tl.constexpr,
 ):
     # The trip count is fixed at compile time and each pass takes one row
     # with a scalar index, which is the shape this chip's compiler takes.
-    # Every access is affine: the whole row once, then the rope tail again
-    # as two stride-2 halves, the same accesses the SGLang kernel makes.
-    column = tl.arange(0, B)
-    inside = column < D
-    plain = column < D - R
-    half = tl.arange(0, H)
-    paired = half < R // 2
-    tail = D - R + 2 * half
+    #
+    # The row is two contiguous blocks, the part before the rope tail and
+    # the tail as [pairs, 2], each read once and written once under a mask
+    # that is an upper bound. Stride-2 stores into the tail left it wrong
+    # here, and reads shifted by one element are misaligned, so the halves
+    # of each pair are taken apart and put back together in registers: a
+    # product with a 0/1 selector summed over the pair is exact.
+    N: tl.constexpr = D - R
+    head = tl.arange(0, BH)
+    pair = tl.arange(0, HP)
+    part = tl.arange(0, 2)
+    lane = pair[:, None] * 2 + part[None, :]
+    take_real = (part == 0).to(tl.float32)[None, :]
+    take_imag = (part == 1).to(tl.float32)[None, :]
     if HAS_W:
-        w = tl.load(W + column, inside, other=0.0).to(tl.float32)
-        w_real = tl.load(W + tail, paired, other=0.0).to(tl.float32)
-        w_imag = tl.load(W + tail + 1, paired, other=0.0).to(tl.float32)
+        if N > 0:
+            w_head = tl.load(W + head, head < N, other=0.0).to(tl.float32)
+        w_tail = tl.load(W + N + lane, lane < R, other=0.0).to(tl.float32)
     for chunk in range(CHUNKS):
         row = (tl.program_id(0) + chunk * GRID).to(tl.int64)
         # The rows divide among the programs when M is a multiple of GRID,
         # and then no access needs a row mask.
         if M % GRID == 0:
-            row_mask = inside
-            plain_mask = plain
-            pair_mask = paired
+            head_mask = head < N
+            tail_mask = lane < R
             if HAS_P:
                 position = tl.load(P + row).to(tl.int64)
             else:
                 position = row
         else:
             live = row < M
-            row_mask = inside & live
-            plain_mask = plain & live
-            pair_mask = paired & live
+            head_mask = (head < N) & live
+            tail_mask = (lane < R) & live
             if HAS_P:
                 position = tl.load(P + row, live, other=0).to(tl.int64)
             else:
                 position = row
-        x = tl.load(KV + row * S + column, row_mask, other=0.0).to(tl.float32)
-        inv = tl.rsqrt(tl.sum(x * x, 0) / D + EPS)
-        y = x * inv
-        if HAS_W:
-            y = y * w
-        tl.store(
-            OUT + row * D + column, y.to(OUT.dtype.element_ty), plain_mask
-        )
-        x_real = tl.load(KV + row * S + tail, pair_mask, other=0.0).to(
+        x_tail = tl.load(KV + row * S + N + lane, tail_mask, other=0.0).to(
             tl.float32
         )
-        x_imag = tl.load(KV + row * S + tail + 1, pair_mask, other=0.0).to(
-            tl.float32
-        )
-        x_real = x_real * inv
-        x_imag = x_imag * inv
+        squares = tl.sum(tl.sum(x_tail * x_tail, 1), 0)
+        if N > 0:
+            x_head = tl.load(KV + row * S + head, head_mask, other=0.0).to(
+                tl.float32
+            )
+            squares += tl.sum(x_head * x_head, 0)
+        inv = tl.rsqrt(squares / D + EPS)
+        if N > 0:
+            y_head = x_head * inv
+            if HAS_W:
+                y_head = y_head * w_head
+            tl.store(
+                OUT + row * D + head,
+                y_head.to(OUT.dtype.element_ty),
+                head_mask,
+            )
+        y_tail = x_tail * inv
         if HAS_W:
-            x_real = x_real * w_real
-            x_imag = x_imag * w_imag
-        f_real = tl.load(F + position * FS + 2 * half, pair_mask, other=0.0)
-        f_imag = tl.load(
-            F + position * FS + 2 * half + 1, pair_mask, other=0.0
-        )
+            y_tail = y_tail * w_tail
+        y_real = tl.sum(y_tail * take_real, 1)
+        y_imag = tl.sum(y_tail * take_imag, 1)
+        # The table is interleaved like the row: (real, imag) per pair.
+        f = tl.load(F + position * FS + lane, tail_mask, other=0.0)
+        f_real = tl.sum(f * take_real, 1)
+        f_imag = tl.sum(f * take_imag, 1)
+        out_real = y_real * f_real - y_imag * f_imag
+        out_imag = y_real * f_imag + y_imag * f_real
+        out = out_real[:, None] * take_real + out_imag[:, None] * take_imag
         tl.store(
-            OUT + row * D + tail,
-            (x_real * f_real - x_imag * f_imag).to(OUT.dtype.element_ty),
-            pair_mask,
-        )
-        tl.store(
-            OUT + row * D + tail + 1,
-            (x_real * f_imag + x_imag * f_real).to(OUT.dtype.element_ty),
-            pair_mask,
+            OUT + row * D + N + lane, out.to(OUT.dtype.element_ty), tail_mask
         )
 
 
@@ -113,14 +118,14 @@ def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
     leaves ``kv`` as it was, which is what the task's reference returns.
     """
     m, d = kv.shape
+    # The kernel indexes the table as interleaved (real, imag) floats, which
+    # needs the complex entries of a row next to each other.
     freqs = (
-        freqs_cis.view(torch.float32)
-        if freqs_cis.stride(-1) == 1
-        else torch.view_as_real(freqs_cis)
-    )
+        freqs_cis if freqs_cis.stride(-1) == 1 else freqs_cis.contiguous()
+    ).view(torch.float32)
     out = torch.empty_like(kv)
     if m:
-        r = freqs_cis.shape[-1] * 2
+        half = freqs_cis.shape[-1]
         grid = min(m, CORES)
         _rows.run(
             kv,
@@ -130,14 +135,14 @@ def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
             out,
             m,
             d,
-            r,
+            2 * half,
             kv.stride(0),
             freqs.stride(0),
             eps,
             weight is not None,
             positions is not None,
-            1 << (d - 1).bit_length(),
-            1 << max(r // 2 - 1, 0).bit_length(),
+            1 << max(d - 2 * half - 1, 0).bit_length(),
+            1 << max(half - 1, 0).bit_length(),
             grid,
             (m + grid - 1) // grid,
             grid=(grid,),
