@@ -255,3 +255,48 @@ def test_fused_norm_rope_inplace_strided_table(backend):
         reference(kv, w, eps, freqs_cis, pos),
         **TOLERANCE[kv.dtype],
     )
+
+
+def stride_two(tensor, fill):
+    """The same values as a view with stride 2, every other slot ``fill``."""
+    buffer = torch.full(
+        (2 * tensor.numel(),), fill, dtype=tensor.dtype, device=tensor.device
+    )
+    buffer[::2] = tensor
+    view = buffer[::2]
+    assert view.stride(0) == 2
+    return view
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16]
+)
+@pytest.mark.parametrize("m, head_dim", [(7, 128), (8, 576), (300, 576)])
+def test_fused_norm_rope_inplace_strided_weight(backend, dtype, m, head_dim):
+    # The task constrains only kv's last stride, so weight may be a view
+    # with stride 2; the slots between its values hold something else.
+    kv, w, eps, freqs_cis, pos = make(m, head_dim, 64, dtype)
+    w = stride_two(w, 42)
+    torch.testing.assert_close(
+        load(backend)(kv, w, eps, freqs_cis, pos),
+        reference(kv, w, eps, freqs_cis, pos),
+        **TOLERANCE[dtype],
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16]
+)
+@pytest.mark.parametrize("m, head_dim", [(7, 128), (8, 576), (300, 576)])
+def test_fused_norm_rope_inplace_strided_positions(
+    backend, dtype, m, head_dim
+):
+    kv, w, eps, freqs_cis, pos = make(m, head_dim, 64, dtype)
+    pos = stride_two(pos, 0)
+    torch.testing.assert_close(
+        load(backend)(kv, w, eps, freqs_cis, pos),
+        reference(kv, w, eps, freqs_cis, pos),
+        **TOLERANCE[dtype],
+    )
