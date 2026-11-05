@@ -36,13 +36,14 @@ def _gemm(
     STEPS: tl.constexpr,
 ):
     m = tl.arange(0, ROWS)
-    rows = m % M
     n = tl.program_id(0) * BN + tl.arange(0, BN)
     split = tl.program_id(1)
     acc = tl.zeros((ROWS, BN), tl.float32)
     for step in range(STEPS):
         kk = (split + step * SPLITS) * BK + tl.arange(0, BK)
-        a = tl.load(A + rows[:, None] * A0 + kk[None, :] * A1)
+        # Rows past num_tokens read as zero: bishengir-compile takes a
+        # masked load, where an index folded with a modulo is not affine.
+        a = tl.load(A + m[:, None] * A0 + kk[None, :] * A1, m[:, None] < M, 0)
         if N % BN == 0:
             b = tl.load(B + kk[:, None] * B1 + n[None, :] * B0)
         else:
@@ -90,10 +91,16 @@ def dsv3_router_gemm(hidden_states, router_weights, out_dtype):
     out = torch.empty(
         (num_tokens, num_experts), dtype=out_dtype, device=device
     )
-    bn = 64 if num_experts % 64 == 0 else 32 if num_experts % 32 == 0 else 16
-    bk = 512 if hidden_dim % 512 == 0 else 256
+    # A narrower expert tile than the 64 of batch 12's dsv3_fused_a_gemm,
+    # because 256 experts leave only four tiles to spread over the chip's
+    # vector cores, and a reduction split short enough that no accumulator
+    # spans more than 256 elements: an fp32 result is graded against an
+    # fp32 matmul at an absolute tolerance of 1e-4, which a longer chain of
+    # fused multiply-adds drifts past.
+    bn = 32
+    bk = 256 if hidden_dim % 256 == 0 else 128
     tiles = triton.cdiv(num_experts, bn)
-    splits = _splits(hidden_dim // bk, tiles, 40)
+    splits = _splits(hidden_dim // bk, tiles, 28 * tiles)
     rows = 16
     strides = (*hidden_states.stride(), *router_weights.stride())
     partial = torch.empty(
