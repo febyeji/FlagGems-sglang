@@ -21,60 +21,47 @@ def _row(
     FS: tl.constexpr,
     HAS_P: tl.constexpr,
     INVERSE: tl.constexpr,
-    B: tl.constexpr,
+    PAIRS: tl.constexpr,
 ):
     # One program per (token, head) row, as the SGLang kernel runs.
     #
-    # Each output element is written once, by one contiguous store of the
-    # row: a masked store followed by stride-2 stores into the part it
-    # skipped left elements unwritten here. The other half of each
-    # (real, imag) pair is the same row read one element to the right or to
-    # the left, so every access is a contiguous block under a mask that is
-    # a single range, and the parity picks between the two afterwards.
+    # The row is one contiguous [pairs, 2] block, read once and written
+    # once: no access leaves the row, and the halves of each pair are taken
+    # apart and put back together in registers, a product with a 0/1
+    # selector summed over the pair. Reading the pair partner one element
+    # to the side instead left the last column of every row wrong here,
+    # where that read is the one that leaves the row.
     row = tl.program_id(0).to(tl.int64)
     if HEADS == 1:
         token = row
     else:
         token = row // HEADS
-    column = tl.arange(0, B)
-    inside = column < D
-    odd = (column & 1) == 1
-    to_next = column < D - 1
-    to_prev = (column >= 1) & inside
-    source = X + token * SX0 + (row - token * HEADS) * SX1 + column
-    x = tl.load(source, inside, other=0.0).to(tl.float32)
-    partner = tl.where(
-        odd,
-        tl.load(source - 1, to_prev, other=0.0),
-        tl.load(source + 1, to_next, other=0.0),
-    ).to(tl.float32)
+    pair = tl.arange(0, PAIRS)
+    part = tl.arange(0, 2)
+    lane = pair[:, None] * 2 + part[None, :]
+    take_real = (part == 0).to(tl.float32)[None, :]
+    take_imag = (part == 1).to(tl.float32)[None, :]
+    mask = lane < D
     if HAS_P:
         position = tl.load(P + token).to(tl.int64)
     else:
         position = token
-    # The table is interleaved like the row, so element c of the row reads
-    # entry c: the real part on even c, the imaginary part on odd c.
-    freq = F + position * FS + column
-    f_same = tl.load(freq, inside, other=0.0)
-    f_next = tl.load(freq + 1, to_next, other=0.0)
-    f_prev = tl.load(freq - 1, to_prev, other=0.0)
+    source = X + token * SX0 + (row - token * HEADS) * SX1 + lane
+    x = tl.load(source, mask, other=0.0).to(tl.float32)
+    x_real = tl.sum(x * take_real, 1)
+    x_imag = tl.sum(x * take_imag, 1)
+    # The table is interleaved like the row: (real, imag) per pair.
+    f = tl.load(F + position * FS + lane, mask, other=0.0)
+    f_real = tl.sum(f * take_real, 1)
+    f_imag = tl.sum(f * take_imag, 1)
     if INVERSE:
-        # Even c: real * f_real + imag * f_imag.
-        # Odd c: imag * f_real - real * f_imag.
-        out = tl.where(
-            odd,
-            x * f_prev - partner * f_same,
-            x * f_same + partner * f_next,
-        )
+        out_real = x_real * f_real + x_imag * f_imag
+        out_imag = x_imag * f_real - x_real * f_imag
     else:
-        # Even c: real * f_real - imag * f_imag.
-        # Odd c: imag * f_real + real * f_imag.
-        out = tl.where(
-            odd,
-            x * f_prev + partner * f_same,
-            x * f_same - partner * f_next,
-        )
-    tl.store(OUT + row * D + column, out.to(OUT.dtype.element_ty), inside)
+        out_real = x_real * f_real - x_imag * f_imag
+        out_imag = x_real * f_imag + x_imag * f_real
+    out = out_real[:, None] * take_real + out_imag[:, None] * take_imag
+    tl.store(OUT + row * D + lane, out.to(OUT.dtype.element_ty), mask)
 
 
 def apply_rotary_emb(x, freqs_cis, positions, inverse):
@@ -96,7 +83,6 @@ def apply_rotary_emb(x, freqs_cis, positions, inverse):
         freqs = (
             freqs_cis if freqs_cis.stride(-1) == 1 else freqs_cis.contiguous()
         ).view(torch.float32)
-        b = 1 << (d - 1).bit_length()
         _row.run(
             x,
             freqs,
@@ -109,10 +95,10 @@ def apply_rotary_emb(x, freqs_cis, positions, inverse):
             freqs.stride(0),
             positions is not None,
             inverse,
-            b,
+            1 << ((d + 1) // 2 - 1).bit_length(),
             grid=(n,),
             warmup=False,
-            num_warps=4 if b <= 4096 else 8,
+            num_warps=4,
             isCloseMemoryAsync=False,
         )
     return out
