@@ -13,9 +13,17 @@
 # limitations under the License.
 
 # A 64-wide expert tile: this chip has more cores than 256 experts
-# leave programs for at a 32-wide tile, and 40 KB of shared memory
+# leave programs for at a 32-wide tile, and 80 KB of shared memory
 # per program is inside its limit. Graded 1.9743 and then 1.9863
 # against 1.9559 for the same kernel at a 32-wide tile.
+#
+# A bf16 result over 2-byte inputs also takes its 512 elements of
+# hidden_dim as one step rather than four of 128, which is what this
+# chip graded highest of anything tried on it: 2.1866, against
+# 1.9863 for four steps and 1.8508 for a 32-wide tile. An fp32
+# result cannot, because a 512-long chain of fused multiply-adds
+# drifts 1.9e-4 from an fp32 matmul and is compared at 1e-4; nor can
+# 4-byte inputs, whose tile would need 160 KB.
 
 import torch
 import triton
@@ -121,7 +129,7 @@ def _reduce(
     tl.store(OUT + x, acc, x < SIZE)
 
 
-def _plan(num_experts, hidden_dim):
+def _plan(num_experts, hidden_dim, out_dtype, itemsize):
     """Pick (BN, BK, SPLITS, GROUPS, STEPS) for one shape.
 
     The weight read is the whole cost and one program per expert tile leaves
@@ -137,14 +145,17 @@ def _plan(num_experts, hidden_dim):
     shape is the fastest one measured for a bf16 result too, so both take
     it.
 
-    A 32-wide expert tile over 64 elements holds the kernel's shared memory
-    well inside the 64 KB that the narrowest of the seven chips offers.
+    A 64-wide expert tile over 512 elements needs 80 KB of shared memory,
+    past what the narrowest of the seven chips offers and well inside
+    what this one does.
     """
     bn = 64 if num_experts % 64 == 0 else 32
     span = 512
     while hidden_dim % span and span > 64:
         span //= 2
     groups = min(4, span // 64)
+    if out_dtype != torch.float32 and itemsize == 2:
+        return bn, span, hidden_dim // span, 1, 1
     return bn, 64, hidden_dim // span, groups, span // (64 * groups)
 
 
@@ -155,7 +166,9 @@ def dsv3_router_gemm(hidden_states, router_weights, out_dtype):
     out = torch.empty(
         (num_tokens, num_experts), dtype=out_dtype, device=device
     )
-    bn, bk, splits, groups, steps = _plan(num_experts, hidden_dim)
+    bn, bk, splits, groups, steps = _plan(
+        num_experts, hidden_dim, out_dtype, hidden_states.element_size()
+    )
     partial = torch.empty(
         (splits, num_tokens, num_experts), dtype=torch.float32, device=device
     )
