@@ -14,9 +14,9 @@
 
 # This chip keeps the earlier shape, where a bf16 result takes
 # 256 elements of hidden_dim per step in one accumulator rather
-# than 512 in four of 128. Graded 3.2161. The current generic
-# kernel has no number here: both runs that carried it hit a
-# full disk on the grader before the first case ran.
+# than 512 in four of 128. Graded 3.2161. Neither shape has a
+# number here since then: every run has hit a full disk on this
+# chip's grader before its first case ran.
 
 import torch
 import triton

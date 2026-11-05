@@ -14,8 +14,8 @@
 
 # This chip keeps the earlier shape, where a bf16 result takes
 # 256 elements of hidden_dim per step in one accumulator rather
-# than 512 in four of 128. Graded 11.4477 for this file against
-# 10.7069 for the current generic kernel.
+# than 512 in four of 128. Graded 11.4477 and then 11.0374 for
+# this file against 10.7069 for the generic kernel.
 
 import torch
 import triton
