@@ -23,57 +23,59 @@ def _row(
     HAS_W: tl.constexpr,
     HAS_P: tl.constexpr,
     B: tl.constexpr,
-    H: tl.constexpr,
 ):
-    # One program per row, as the SGLang kernel runs, with the row read once
-    # as a contiguous block and the rope tail again as two stride-2 halves.
-    # The compiler here is told which accesses are contiguous, and loads are
-    # clamped instead of masked where the row is not a power of two wide.
+    # One program per row, as the SGLang kernel runs.
+    #
+    # Each output element is written once, by one contiguous store of the
+    # row: a masked store followed by stride-2 stores into the part it
+    # skipped left elements unwritten here. The other half of each
+    # (real, imag) pair is the same row read one element to the right or
+    # to the left, so every access is a contiguous block under a mask that
+    # is a single range, and the parity picks between the two afterwards.
     row = tl.program_id(0).to(tl.int64)
     column = tl.arange(0, B)
-    if B == D:
-        x = tl.load(
-            KV + row * S + column, offset_state_policy="continuous"
-        ).to(tl.float32)
-    else:
-        x = tl.load(KV + row * S + tl.minimum(column, D - 1)).to(tl.float32)
-        x = tl.where(column < D, x, 0.0)
+    inside = column < D
+    t = column - (D - R)
+    tail = (column >= D - R) & inside
+    odd = (t & 1) == 1
+    to_next = (column >= D - R) & (column < D - 1)
+    to_prev = (column >= D - R + 1) & inside
+    source = KV + row * S + column
+    x = tl.load(source, inside, other=0.0).to(tl.float32)
     inv = tl.rsqrt(tl.sum(x * x, 0) / D + EPS)
+    partner = tl.where(
+        odd,
+        tl.load(source - 1, to_prev, other=0.0),
+        tl.load(source + 1, to_next, other=0.0),
+    ).to(tl.float32)
     y = x * inv
+    y_pair = partner * inv
     if HAS_W:
-        if B == D:
-            w = tl.load(W + column, offset_state_policy="continuous")
-        else:
-            w = tl.load(W + tl.minimum(column, D - 1))
-        y = y * w.to(tl.float32)
-    tl.store(
-        OUT + row * D + column, y.to(OUT.dtype.element_ty), column < D - R
-    )
-    half = tl.arange(0, H)
-    if H == R // 2:
-        pair = half
-    else:
-        pair = tl.minimum(half, R // 2 - 1)
-    tail = D - R + 2 * pair
-    x_real = tl.load(KV + row * S + tail).to(tl.float32) * inv
-    x_imag = tl.load(KV + row * S + tail + 1).to(tl.float32) * inv
-    if HAS_W:
-        x_real = x_real * tl.load(W + tail).to(tl.float32)
-        x_imag = x_imag * tl.load(W + tail + 1).to(tl.float32)
+        y = y * tl.load(W + column, inside, other=0.0).to(tl.float32)
+        y_pair = y_pair * tl.where(
+            odd,
+            tl.load(W + column - 1, to_prev, other=0.0),
+            tl.load(W + column + 1, to_next, other=0.0),
+        ).to(tl.float32)
     if HAS_P:
         position = tl.load(P + row).to(tl.int64)
     else:
         position = row
-    f_real = tl.load(F + position * FS + 2 * pair)
-    f_imag = tl.load(F + position * FS + 2 * pair + 1)
-    real = (x_real * f_real - x_imag * f_imag).to(OUT.dtype.element_ty)
-    imag = (x_real * f_imag + x_imag * f_real).to(OUT.dtype.element_ty)
-    if H == R // 2:
-        tl.store(OUT + row * D + tail, real)
-        tl.store(OUT + row * D + tail + 1, imag)
-    else:
-        tl.store(OUT + row * D + tail, real, half < R // 2)
-        tl.store(OUT + row * D + tail + 1, imag, half < R // 2)
+    # The table is interleaved like the row, so element t of the tail reads
+    # entry t: the real part on even t, the imaginary part on odd t.
+    freq = F + position * FS + t
+    f_same = tl.load(freq, tail, other=0.0)
+    f_next = tl.load(freq + 1, to_next, other=0.0)
+    f_prev = tl.load(freq - 1, to_prev, other=0.0)
+    # Even t: real * f_real - imag * f_imag.
+    # Odd t: imag * f_real + real * f_imag.
+    rotated = tl.where(
+        odd,
+        y * f_prev + y_pair * f_same,
+        y * f_same - y_pair * f_next,
+    )
+    out = tl.where(tail, rotated, y)
+    tl.store(OUT + row * D + column, out.to(OUT.dtype.element_ty), inside)
 
 
 def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
@@ -83,14 +85,13 @@ def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
     leaves ``kv`` as it was, which is what the task's reference returns.
     """
     m, d = kv.shape
+    # The kernel indexes the table as interleaved (real, imag) floats, which
+    # needs the complex entries of a row next to each other.
     freqs = (
-        freqs_cis.view(torch.float32)
-        if freqs_cis.stride(-1) == 1
-        else torch.view_as_real(freqs_cis)
-    )
+        freqs_cis if freqs_cis.stride(-1) == 1 else freqs_cis.contiguous()
+    ).view(torch.float32)
     out = torch.empty_like(kv)
     if m:
-        r = freqs_cis.shape[-1] * 2
         b = 1 << (d - 1).bit_length()
         _row.run(
             kv,
@@ -99,14 +100,13 @@ def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
             positions,
             out,
             d,
-            r,
+            freqs_cis.shape[-1] * 2,
             kv.stride(0),
             freqs.stride(0),
             eps,
             weight is not None,
             positions is not None,
             b,
-            1 << max(r // 2 - 1, 0).bit_length(),
             grid=(m,),
             warmup=False,
             num_warps=4 if b <= 4096 else 8,

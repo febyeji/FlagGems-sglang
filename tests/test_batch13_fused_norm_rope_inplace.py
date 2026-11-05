@@ -221,3 +221,35 @@ def test_fused_norm_rope_inplace_empty(backend):
     kv, w, eps, freqs_cis, pos = make(0, 512, 64, torch.bfloat16)
     out = load(backend)(kv, w, eps, freqs_cis, pos)
     assert out.shape == (0, 512) and out.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("m", [1, 7, 8, 74])
+@pytest.mark.parametrize("weight", [True, False])
+@pytest.mark.parametrize("positions", [True, False])
+def test_fused_norm_rope_inplace_mla_rows(backend, m, weight, positions):
+    # The graded cases include 576-wide rows (512 nope + 64 rope) at a few
+    # rows each; the first Ascend kernel got their rope tail wrong.
+    check(
+        backend,
+        m,
+        576,
+        64,
+        torch.bfloat16,
+        weight=weight,
+        positions=positions,
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_fused_norm_rope_inplace_strided_table(backend):
+    # A table whose complex entries are not adjacent, sliced from a wider
+    # one; the reference indexes it the same way through view_as_real.
+    kv, w, eps, freqs_cis, pos = make(129, 576, 64, torch.bfloat16)
+    freqs_cis = torch.stack([freqs_cis, freqs_cis.conj()], dim=-1)[..., 0]
+    assert freqs_cis.stride(-1) != 1
+    torch.testing.assert_close(
+        load(backend)(kv, w, eps, freqs_cis, pos),
+        reference(kv, w, eps, freqs_cis, pos),
+        **TOLERANCE[kv.dtype],
+    )
