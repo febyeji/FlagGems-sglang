@@ -88,6 +88,14 @@ def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
     # and cost about 9 us each, and a complex64 table viewed as float32 is
     # a cheaper view than view_as_real.
     m, d = kv.shape
+    # The task promises only that kv's last dimension is dense. The kernel
+    # reads weight and positions at unit stride, so a strided view of
+    # either is made contiguous first; is_contiguous() is a flag read and
+    # costs half a microsecond when there is nothing to do.
+    if weight is not None and not weight.is_contiguous():
+        weight = weight.contiguous()
+    if positions is not None and not positions.is_contiguous():
+        positions = positions.contiguous()
     # The kernel indexes the table as interleaved (real, imag) floats, which
     # needs the complex entries of a row next to each other.
     freqs = (
