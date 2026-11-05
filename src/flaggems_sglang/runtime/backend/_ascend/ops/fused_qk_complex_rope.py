@@ -43,6 +43,8 @@ def _fused_qk_complex_rope_kernel(
     KH: tl.constexpr,
     KD: tl.constexpr,
     FT: tl.constexpr,
+    FP: tl.constexpr,
+    FC: tl.constexpr,
     EXACT: tl.constexpr,
     WHOLE: tl.constexpr,
 ):
@@ -60,10 +62,10 @@ def _fused_qk_complex_rope_kernel(
                 mask = None
             else:
                 mask = (head < HEADS) & (pair[None, :] < HALF)
-            freq = F + token * FT + pair * 2
+            freq = F + token * FT + pair * FP
             cos = tl.load(freq, mask=None if EXACT else pair < HALF)[None, :]
             sin = tl.load(
-                freq + 1, mask=None if EXACT else pair < HALF
+                freq + FC, mask=None if EXACT else pair < HALF
             )[None, :]
             q_in = Q + token * QT + head * QH + pair[None, :] * (2 * QD)
             k_in = K + token * KT + head * KH + pair[None, :] * (2 * KD)
@@ -107,11 +109,20 @@ def fused_qk_complex_rope(q, k, freqs_cis):
     half = shape[-1] // 2
     q_flat = q if q.ndim == 3 else q.view(-1, heads, half * 2)
     k_flat = k if k.ndim == 3 else k.view(-1, heads, half * 2)
-    freqs = torch.view_as_real(freqs_cis).view(-1, half, 2)
+    # A complex64 row is a pair of FP32 words, and the view of it as
+    # floats keeps whatever strides the frequencies arrived with, which
+    # a slice of a wider table need not make contiguous. Only leading
+    # dimensions are flattened, and reshape copies when they do not
+    # collapse into one.
+    freqs = torch.view_as_real(freqs_cis)
+    if freqs.ndim > 3:
+        freqs = freqs.reshape(-1, half, 2)
     tokens = q_flat.shape[0]
     q_out = torch.empty(q_flat.shape, dtype=q.dtype, device=q.device)
     k_out = torch.empty(k_flat.shape, dtype=k.dtype, device=k.device)
     if tokens:
+        q_stride = q_flat.stride()
+        k_stride = k_flat.stride()
         pairs = triton.next_power_of_2(half)
         block_h = _block_heads(heads, pairs)
         hblocks = triton.cdiv(heads, block_h)
@@ -131,13 +142,11 @@ def fused_qk_complex_rope(q, k, freqs_cis):
             pairs,
             block_h,
             hblocks,
-            q_flat.stride(0),
-            q_flat.stride(1),
-            q_flat.stride(2),
-            k_flat.stride(0),
-            k_flat.stride(1),
-            k_flat.stride(2),
-            freqs.stride(0),
+            # One call for the three strides: at these sizes the
+            # kernel runs in the time the call around it takes.
+            *q_stride,
+            *k_stride,
+            *freqs.stride(),
             pairs == half and heads % block_h == 0,
             work % programs == 0,
             num_warps=NUM_WARPS,
