@@ -20,7 +20,16 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 OPERATOR = "fused_qk_complex_rope"
-BACKENDS = ["generic", "ascend", "kunlunxin"]
+BACKENDS = [
+    "generic",
+    "ascend",
+    "kunlunxin",
+    "metax",
+    "iluvatar",
+    "hygon",
+    "nvidia",
+    "amd",
+]
 # The task's own tolerance, per dtype. The kernel rounds once to the input
 # dtype, so the difference it allows is one rounding step wide.
 TOLERANCE = [
