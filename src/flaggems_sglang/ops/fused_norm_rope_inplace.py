@@ -116,6 +116,9 @@ def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
             rows,
             grid=((m + rows - 1) // rows,),
             warmup=False,
+            # One warp per program: graded faster than four on tianshu,
+            # muxi, haiguang and card_a. Card B keeps four in its own copy.
+            num_warps=1,
         )
     return out
 

@@ -35,6 +35,8 @@ BACKENDS = [
         "metax",
         "iluvatar",
         "hygon",
+        "nvidia",
+        "amd",
     ]
     if backend == "generic"
     or (
