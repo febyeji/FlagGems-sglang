@@ -114,22 +114,43 @@ def _reduce(
     tl.store(OUT + x, acc, x < SIZE)
 
 
-def _plan(num_tokens, num_experts, hidden_dim):
-    """Pick (BN, BK, SPLITS) for one shape.
+def _closest_divisor(chunks, want):
+    best = 1
+    for candidate in range(1, chunks + 1):
+        if chunks % candidate == 0 and abs(candidate - want) < abs(
+            best - want
+        ):
+            best = candidate
+    return best
 
-    The weight read is the whole cost, so the grid has to be wide enough to
-    saturate the memory system: split the reduction until there are enough
-    programs, keeping ``BK * SPLITS`` a divisor of ``hidden_dim``.
+
+def _plan(num_tokens, num_experts, hidden_dim, out_dtype):
+    """Pick (BN, BK, SPLITS) for one shape and output dtype.
+
+    The weight read is the whole cost and one program per expert tile leaves
+    most of the memory system idle, so the reduction is split until the grid
+    is about 80 programs wide. ``BK * SPLITS`` divides ``hidden_dim``, which
+    keeps the k loop free of masks, and a 32-wide expert tile holds the
+    kernel's shared memory at 24 KB so that chips with a 64 KB limit run it.
+
+    An fp32 result is compared against an fp32 matmul of the same inputs at
+    an absolute tolerance of 1e-4, and the error of a run of fused
+    multiply-adds grows with the length of the chain: 7168 in one
+    accumulator drifts by 4e-4, 128 by 5e-5, the same as the reference's own
+    drift. So an fp32 result splits the reduction until no accumulator spans
+    more than 128 elements. A bf16 result rounds to 8 mantissa bits and
+    takes the wider tile instead.
     """
-    bn = 64 if num_experts % 64 == 0 else 32 if num_experts % 32 == 0 else 16
-    bk = 512 if hidden_dim % 512 == 0 else 256
+    bn = 32 if num_experts % 32 == 0 else 16
     tiles = triton.cdiv(num_experts, bn)
-    splits = 1
-    for candidate in (32, 28, 16, 14, 8, 7, 4, 2):
-        if hidden_dim % (bk * candidate) == 0 and tiles * candidate <= 256:
-            splits = candidate
-            break
-    return bn, bk, splits
+    if out_dtype == torch.float32:
+        bk = 128 if hidden_dim % 128 == 0 else 64
+        want = 56.0
+    else:
+        bk = 256 if hidden_dim % 256 == 0 else 128
+        want = max(1.0, 80 / tiles)
+    chunks = hidden_dim // bk
+    return bn, bk, _closest_divisor(chunks, want)
 
 
 def dsv3_router_gemm(hidden_states, router_weights, out_dtype):
@@ -139,7 +160,7 @@ def dsv3_router_gemm(hidden_states, router_weights, out_dtype):
     out = torch.empty(
         (num_tokens, num_experts), dtype=out_dtype, device=device
     )
-    bn, bk, splits = _plan(num_tokens, num_experts, hidden_dim)
+    bn, bk, splits = _plan(num_tokens, num_experts, hidden_dim, out_dtype)
     strides = (*hidden_states.stride(), *router_weights.stride())
     rows = 16
     if splits == 1:

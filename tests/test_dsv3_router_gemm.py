@@ -26,15 +26,13 @@ from . import conftest as cfg
 # Tolerance helper
 # ---------------------------------------------------------------------------
 
-# The fp32 output of a bf16 reduction over hidden_dim (a multiple of 1024)
-# carries an accumulation noise floor: the partial sums reach ~sqrt(K) in
-# magnitude, so two summation orders differ by ~1e-4 in absolute terms where
-# the result itself cancels to near zero. The library's own rule for reductions
-# (``testing.assert_close``) scales atol by the reduction length; this keeps a
-# fixed atol well above that floor and still catches a wrong element, which is
-# off by O(1).
+# An fp32 result is held to 1e-4, the same tolerance the competition harness
+# applies, and that is tight for this reduction: a chain of 7168 fused
+# multiply-adds drifts about 4e-4 from an fp32 matmul of the same inputs,
+# which is why the kernel splits the reduction until no accumulator spans
+# more than 128 elements.
 _TOLERANCES = {
-    torch.float32: dict(atol=2e-3, rtol=1e-4),
+    torch.float32: dict(atol=1e-4, rtol=1e-4),
     torch.bfloat16: dict(atol=1.5e-2, rtol=1.5e-2),
     torch.float16: dict(atol=1e-2, rtol=1e-2),
 }
