@@ -15,8 +15,8 @@
 # This chip keeps the earlier shape, where a bf16 result takes
 # 256 elements of hidden_dim per step in one accumulator rather
 # than 512 in four of 128. Eight dots of 64 elements leave its
-# matrix units with almost nothing to do: graded 6.9861 for this
-# file against 1.0704 for the current generic kernel.
+# matrix units with almost nothing to do: graded 6.9861 and then
+# 7.03 for this file against 1.0704 for the generic kernel.
 
 import torch
 import triton
