@@ -19,8 +19,11 @@ NUM_WARPS = 4
 
 
 def _block_heads(tokens, heads, pairs):
-    block = max(1, min(heads, TILE // pairs))
-    while block > 1 and (heads % block or tokens * (heads // block) < PROGRAMS):
+    # A tile side has to be a power of two: several of the chips reject
+    # `tl.arange` over anything else. A block that does not divide the
+    # head count is masked instead.
+    block = 1 << (max(1, min(heads, TILE // pairs)).bit_length() - 1)
+    while block > 1 and tokens * triton.cdiv(heads, block) < PROGRAMS:
         block //= 2
     return block
 
