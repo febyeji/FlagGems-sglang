@@ -10,6 +10,17 @@ tile is as wide as the backend's other elementwise kernels take it
 (16384 elements against the generic 2048), and the block is chosen to
 divide the element count so the loads and the store carry no mask, which
 is what keeps the mask-free kernel separate from the one that needs it.
+
+The activation is the one place this file cannot follow the generic one.
+`tl.sigmoid` lowers to `triton_xpu.vsigmoidf`, which this backend marks
+illegal, and the first graded run of this operator failed to compile
+here for that reason alone. Writing the sigmoid out as
+`1 / (1 + exp(-u))` is the same function to the last bit and reaches the
+chip through `exp`, which its shipped attention and state kernels
+already use. The repository's own Kunlun GELU takes a clamped
+polynomial tanh instead; that one is divide-free but leaves a residue
+of about 3.4e-4 of the input at the negative tail, which passes a
+normal-distributed correctness case and fails an input of a few hundred.
 """
 
 import torch
@@ -43,8 +54,13 @@ def _bias_gelu_tanh_exact(
     dtype = Y.dtype.element_ty
     z = (x + bias).to(dtype).to(tl.float32)
     # z * sigmoid(z * (2*sqrt(2/pi) + 2*sqrt(2/pi)*0.044715 * z^2)), the
-    # sigmoid identity of 0.5*z*(1 + tanh(sqrt(2/pi)*(z + 0.044715 z^3))).
-    y = z * tl.sigmoid(z * (1.5957691216057308 + 0.07133681239524435 * z * z))
+    # sigmoid identity of 0.5*z*(1 + tanh(sqrt(2/pi)*(z + 0.044715 z^3))),
+    # with the sigmoid written out because this backend rejects the
+    # intrinsic. A z far enough negative sends the exponent to infinity
+    # and the quotient to zero, which is where the activation goes, so
+    # the tails need no clamp.
+    u = z * (1.5957691216057308 + 0.07133681239524435 * z * z)
+    y = z / (1.0 + tl.exp(-u))
     tl.store(Y + offs, y.to(dtype))
 
 
@@ -70,7 +86,8 @@ def _bias_gelu_tanh_masked(
     bias = tl.load(B + offs % H).to(tl.float32)
     dtype = Y.dtype.element_ty
     z = (x + bias).to(dtype).to(tl.float32)
-    y = z * tl.sigmoid(z * (1.5957691216057308 + 0.07133681239524435 * z * z))
+    u = z * (1.5957691216057308 + 0.07133681239524435 * z * z)
+    y = z / (1.0 + tl.exp(-u))
     tl.store(Y + offs, y.to(dtype), mask=mask)
 
 
