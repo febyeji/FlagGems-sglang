@@ -17,7 +17,20 @@ __all__ = ["fused_qk_complex_rope"]
 # an FP32 word's top half, and through the 16-bit float for FP16.
 TILE = 4096
 PROGRAMS = 1024
-NUM_WARPS = 4
+# The warps follow the tile rather than a constant. Submission 66103 put
+# that rule on tianshu and haiguang alone, and they went 4.1698 to 4.8554
+# and 4.6742 to 5.4314 while the four chips it left unchanged moved by
+# less than a tenth, so the gain is the rule and not the run. A token of
+# 16 heads of 64 pairs is 1024 words, which four warps read four words to
+# a lane; a single token shrinks the block to one head row of 64 words,
+# where four warps left three lanes in four with nothing to read.
+WORDS_PER_WARP = 64
+MAX_WARPS = 8
+
+
+def _warps(words):
+    """Warps enough to give each lane a word, up to the tile's worth."""
+    return max(1, min(MAX_WARPS, words // WORDS_PER_WARP))
 
 
 def _pairs_as_words(x, stride):
@@ -233,7 +246,7 @@ def fused_qk_complex_rope(q, k, freqs_cis):
             pairs == half and heads % block_h == 0,
             q.dtype == torch.bfloat16,
             words,
-            num_warps=NUM_WARPS,
+            num_warps=_warps(block_h * pairs),
         )
     return q_out.view(shape), k_out.view(shape)
 

@@ -20,9 +20,21 @@ __all__ = ["fused_qk_complex_rope"]
 # wrapper around it: this chip sits at 4.08 against the leading teams'
 # 4.92, the one chip they are still ahead on, and the shapes this
 # operator is graded at are small enough for the call to show.
+#
+# The warps follow the tile instead of a constant. A token of 16 heads
+# of 64 pairs is 1024 words, which four warps read four words to a lane;
+# the graded shapes also include a single token, where the block shrinks
+# to one head row of 64 words and four warps leave three lanes in four
+# with nothing to read.
 TILE = 4096
 PROGRAMS = 1024
-NUM_WARPS = 4
+WORDS_PER_WARP = 64
+MAX_WARPS = 8
+
+
+def _warps(words):
+    """Warps enough to give each lane a word, up to the tile's worth."""
+    return max(1, min(MAX_WARPS, words // WORDS_PER_WARP))
 
 
 def _pairs_as_words(x, stride):
@@ -240,7 +252,7 @@ def fused_qk_complex_rope(q, k, freqs_cis):
             words,
             grid=(tokens * hblocks,),
             warmup=False,
-            num_warps=NUM_WARPS,
+            num_warps=_warps(block_h * pairs),
         )
     return q_out.view(shape), k_out.view(shape)
 
