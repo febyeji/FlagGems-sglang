@@ -205,6 +205,19 @@ def test_bias_gelu_tanh_on_another_device(backend, dtype, _tol, shape):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("dtype,_tol", TOLERANCE)
+def test_bias_gelu_tanh_non_contiguous_inputs(backend, dtype, _tol):
+    # The kernel walks a flat index, so the launcher packs anything that
+    # is not contiguous first. What it packs is a fresh allocation, and
+    # so takes the held kernel's aligned path.
+    wide, bias_wide = make((64, 2048), dtype=dtype, seed=13)
+    x = wide[:, ::2]
+    bias = bias_wide[::2]
+    assert not x.is_contiguous() and not bias.is_contiguous()
+    assert_matches(load(backend), (x, bias))
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype,_tol", TOLERANCE)
 @pytest.mark.parametrize("offset", [1, 3, 7])
 def test_bias_gelu_tanh_unaligned_inputs(backend, dtype, _tol, offset):
     # A launcher that holds a compiled kernel holds one that Triton
@@ -226,6 +239,34 @@ def test_bias_gelu_tanh_unaligned_inputs(backend, dtype, _tol, offset):
     # Two bytes an element, so an odd offset lands off the boundary.
     assert x.data_ptr() % 16 and bias.data_ptr() % 16
     assert_matches(load(backend), (x, bias))
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype,_tol", TOLERANCE)
+def test_bias_gelu_tanh_on_a_side_stream(backend, dtype, _tol):
+    # A launcher that hands Triton a stream has to hand it the one the
+    # caller is on, or the kernel races the allocation of its own
+    # output and whatever the caller queues next.
+    device = "cuda"
+    solution = load(backend)
+    case = make((512, 1024), dtype=dtype, seed=7)
+    expected = reference(*case)
+    side = torch.cuda.Stream(device=device)
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        # Work queued ahead of the call on the same stream: a kernel
+        # launched elsewhere would not wait for it.
+        busy = torch.randn(4096, 4096, device=device, dtype=torch.float32)
+        for _ in range(8):
+            busy = busy @ busy.T / 4096.0
+        actual = solution(*case)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        actual.to(torch.float32),
+        expected.to(torch.float32),
+        **tolerance(dtype),
+    )
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
