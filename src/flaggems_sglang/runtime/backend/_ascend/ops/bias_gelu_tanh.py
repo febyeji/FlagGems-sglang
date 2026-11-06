@@ -13,9 +13,12 @@ the tiles in a loop whose trip count is a compile-time constant, which
 is the shape this chip's compiler schedules best.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
+from triton.runtime import driver
 
 __all__ = ["bias_gelu_tanh"]
 
@@ -96,6 +99,59 @@ def _shape(h, m):
     return cols, nc, rows
 
 
+def _grid(m, h):
+    """Program count and the compile-time shape of the tile loop."""
+    cols, nc, rows = _shape(h, m)
+    nrb = (m + rows - 1) // rows
+    work = nrb * nc
+    progs = min(work, PROGRAMS)
+    trips = (work + progs - 1) // progs
+    return cols, nc, rows, work, progs, trips
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled(dtype, total, m, h, device):
+    """The compiled kernel and its grid for one shape, or None.
+
+    `JITFunction.run` rebinds the arguments and rebuilds the
+    specialization key on every call before it reaches the launcher.
+    Every scalar this kernel takes is a compile-time constant, so one
+    shape is one kernel, and `run` hands that kernel back; the launcher
+    keeps it rather than paying for the lookup again.
+
+    `warmup` compiles without launching, which is what lets the probe
+    be eight elements wide: the kernel is specialized on the dtype and
+    on 16-byte alignment, and the caller takes this path only for
+    aligned pointers. Nothing about a call's data is kept — this is the
+    compiled kernel, the same object Triton's own cache holds.
+    """
+    cols, nc, rows, work, progs, trips = _grid(m, h)
+    probe = torch.empty(8, dtype=dtype, device=device)
+    kernel = _bias_gelu_tanh_kernel.run(
+        probe,
+        probe,
+        probe,
+        m,
+        h,
+        cols,
+        nc,
+        rows,
+        work,
+        trips,
+        progs,
+        trips * progs != work,
+        h % cols == 0 and m % rows == 0,
+        total >= INT32_LIMIT,
+        grid=(progs,),
+        warmup=True,
+        num_warps=1,
+        num_stages=1,
+    )
+    if kernel is None or not hasattr(kernel, "__getitem__"):
+        return None
+    return kernel, progs
+
+
 def _launch(src, row, out, total, m, h):
     """Shape the grid and enter the kernel.
 
@@ -103,11 +159,7 @@ def _launch(src, row, out, total, m, h):
     constant, so the kernel's loop unrolls and the grid never depends on
     a value the host has to divide at launch time.
     """
-    cols, nc, rows = _shape(h, m)
-    nrb = (m + rows - 1) // rows
-    work = nrb * nc
-    progs = min(work, PROGRAMS)
-    trips = (work + progs - 1) // progs
+    cols, nc, rows, work, progs, trips = _grid(m, h)
     _bias_gelu_tanh_kernel.run(
         src,
         row,
@@ -149,12 +201,27 @@ def bias_gelu_tanh(x, bias):
     # pointer it cannot reach from there, so an input that lives
     # elsewhere has to make its own device current first. This backend
     # reaches torch as `npu`, so the module comes from the tensor.
-    device_fn = torch.cuda if src.is_cuda else getattr(torch, src.device.type)
-    if device_fn.current_device() == src.get_device():
-        _launch(src, row, out, total, total // h, h)
-    else:
-        with device_fn.device(src.device):
+    dev = src.device
+    device_fn = torch.cuda if src.is_cuda else getattr(torch, dev.type)
+    if device_fn.current_device() != dev.index:
+        with device_fn.device(dev):
             _launch(src, row, out, total, total // h, h)
+        return out
+    # The held kernel assumes 16-byte aligned pointers. The output is a
+    # fresh allocation and so always aligned; the inputs are the
+    # caller's and may be a view that is not.
+    if ((src.data_ptr() | row.data_ptr()) & 15) == 0:
+        held = _compiled(src.dtype, total, total // h, h, dev)
+        if held is not None:
+            kernel, progs = held
+            kernel[(progs, 1, 1)](
+                src,
+                row,
+                out,
+                stream=driver.active.get_current_stream(dev.index),
+            )
+            return out
+    _launch(src, row, out, total, total // h, h)
     return out
 
 
