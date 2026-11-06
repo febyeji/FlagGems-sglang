@@ -14,7 +14,8 @@ __all__ = ["fused_qk_complex_rope"]
 # kernel in one graded run, and this chip ran the strided file
 # at 3.00. The halves come out
 # of the word with shifts, which is exact for BF16 because its bits are
-# an FP32 word's top half, and through the 16-bit float for FP16. Two warps: this chip reached
+# an FP32 word's top half, and through the 16-bit float for FP16.
+# Two warps: this chip reached
 # 3.18 with the word form at four, the lowest of the five GPU-like
 # chips, where the others reached 4.1 to 4.5.
 TILE = 4096
@@ -174,8 +175,13 @@ def fused_qk_complex_rope(q, k, freqs_cis):
     heads = shape[-2]
     dim = shape[-1]
     half = dim // 2
-    q_flat = q if q.ndim == 3 else q.view(-1, heads, dim)
-    k_flat = k if k.ndim == 3 else k.view(-1, heads, dim)
+    # A view of a QKV projection keeps its token stride, so a three
+    # dimensional input is taken as it is and its strides are handed in.
+    # Anything deeper has its leading dimensions flattened into one;
+    # reshape returns a view when they collapse into a single stride and
+    # copies when they do not, which view reports as an error instead.
+    q_flat = q if q.ndim == 3 else q.reshape(-1, heads, dim)
+    k_flat = k if k.ndim == 3 else k.reshape(-1, heads, dim)
     # A complex64 row is a pair of FP32 words, and the view of it as
     # floats keeps whatever strides the frequencies arrived with, which
     # a slice of a wider table need not make contiguous. Only leading
