@@ -18,41 +18,30 @@ import triton.language as tl
 
 
 @triton.jit
-def _router_direct(
+def _chunk(
     A,
     B,
-    OUT,
-    M: tl.constexpr,
+    acc,
+    rows,
+    n,
+    chunk,
     N: tl.constexpr,
-    K: tl.constexpr,
     A0: tl.constexpr,
     A1: tl.constexpr,
     B0: tl.constexpr,
     B1: tl.constexpr,
-    ROWS: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
-    STEPS: tl.constexpr,
 ):
-    m = tl.arange(0, ROWS)
-    rows = m % M
-    n = tl.program_id(0) * BN + tl.arange(0, BN)
-    acc = tl.zeros((ROWS, BN), tl.float32)
-    for step in tl.static_range(STEPS):
-        kk = step * BK + tl.arange(0, BK)
-        a = tl.load(A + rows[:, None] * A0 + kk[None, :] * A1)
-        if N % BN == 0:
-            b = tl.load(B + n[None, :] * B0 + kk[:, None] * B1)
-        else:
-            b = tl.load(
-                B + n[None, :] * B0 + kk[:, None] * B1, n[None, :] < N, 0.0
-            )
-        acc = tl.dot(a, b, acc, input_precision="ieee")
-    tl.store(
-        OUT + m[:, None] * N + n[None, :],
-        acc,
-        (m[:, None] < M) & (n[None, :] < N),
-    )
+    kk = chunk * BK + tl.arange(0, BK)
+    a = tl.load(A + rows[:, None] * A0 + kk[None, :] * A1)
+    if N % BN == 0:
+        b = tl.load(B + n[None, :] * B0 + kk[:, None] * B1)
+    else:
+        b = tl.load(
+            B + n[None, :] * B0 + kk[:, None] * B1, n[None, :] < N, 0.0
+        )
+    return tl.dot(a, b, acc, input_precision="ieee")
 
 
 @triton.jit
@@ -71,23 +60,36 @@ def _router_split(
     BN: tl.constexpr,
     BK: tl.constexpr,
     SPLITS: tl.constexpr,
+    GROUPS: tl.constexpr,
     STEPS: tl.constexpr,
 ):
     m = tl.arange(0, ROWS)
     rows = m % M
     n = tl.program_id(0) * BN + tl.arange(0, BN)
     split = tl.program_id(1)
-    acc = tl.zeros((ROWS, BN), tl.float32)
+    acc0 = tl.zeros((ROWS, BN), tl.float32)
+    acc1 = tl.zeros((ROWS, BN), tl.float32)
+    acc2 = tl.zeros((ROWS, BN), tl.float32)
+    acc3 = tl.zeros((ROWS, BN), tl.float32)
     for step in tl.static_range(STEPS):
-        kk = (split + step * SPLITS) * BK + tl.arange(0, BK)
-        a = tl.load(A + rows[:, None] * A0 + kk[None, :] * A1)
-        if N % BN == 0:
-            b = tl.load(B + n[None, :] * B0 + kk[:, None] * B1)
-        else:
-            b = tl.load(
-                B + n[None, :] * B0 + kk[:, None] * B1, n[None, :] < N, 0.0
+        base = (step * SPLITS + split) * GROUPS
+        acc0 = _chunk(A, B, acc0, rows, n, base, N, A0, A1, B0, B1, BN, BK)
+        if GROUPS > 1:
+            acc1 = _chunk(
+                A, B, acc1, rows, n, base + 1, N, A0, A1, B0, B1, BN, BK
             )
-        acc = tl.dot(a, b, acc, input_precision="ieee")
+        if GROUPS > 2:
+            acc2 = _chunk(
+                A, B, acc2, rows, n, base + 2, N, A0, A1, B0, B1, BN, BK
+            )
+            acc3 = _chunk(
+                A, B, acc3, rows, n, base + 3, N, A0, A1, B0, B1, BN, BK
+            )
+    acc = acc0
+    if GROUPS > 2:
+        acc = (acc0 + acc1) + (acc2 + acc3)
+    elif GROUPS > 1:
+        acc = acc0 + acc1
     tl.store(
         P + split * M * N + m[:, None] * N + n[None, :],
         acc,
@@ -114,43 +116,31 @@ def _reduce(
     tl.store(OUT + x, acc, x < SIZE)
 
 
-def _closest_divisor(chunks, want):
-    best = 1
-    for candidate in range(1, chunks + 1):
-        if chunks % candidate == 0 and abs(candidate - want) < abs(
-            best - want
-        ):
-            best = candidate
-    return best
-
-
-def _plan(num_tokens, num_experts, hidden_dim, out_dtype):
-    """Pick (BN, BK, SPLITS) for one shape and output dtype.
+def _plan(num_experts, hidden_dim):
+    """Pick (BN, BK, SPLITS, GROUPS, STEPS) for one shape.
 
     The weight read is the whole cost and one program per expert tile leaves
-    most of the memory system idle, so the reduction is split until the grid
-    is about 80 programs wide. ``BK * SPLITS`` divides ``hidden_dim``, which
-    keeps the k loop free of masks, and a 32-wide expert tile holds the
-    kernel's shared memory at 24 KB so that chips with a 64 KB limit run it.
+    most of the memory system idle, so the reduction splits until the grid
+    is wide: every program takes 512 elements of hidden_dim, which is 112
+    programs for a 7168-wide hidden state and 256 experts.
 
-    An fp32 result is compared against an fp32 matmul of the same inputs at
-    an absolute tolerance of 1e-4, and the error of a run of fused
-    multiply-adds grows with the length of the chain: 7168 in one
-    accumulator drifts by 4e-4, 128 by 5e-5, the same as the reference's own
-    drift. So an fp32 result splits the reduction until no accumulator spans
-    more than 128 elements. A bf16 result rounds to 8 mantissa bits and
-    takes the wider tile instead.
+    Inside a program those 512 elements go to four accumulators of 128 each
+    rather than one chain of 512, because an fp32 result is compared against
+    an fp32 matmul at an absolute tolerance of 1e-4 and the drift of a chain
+    of fused multiply-adds grows with its length: 7168 elements drift 4e-4,
+    128 drift 5e-5, which is what the reference itself drifts. The same
+    shape is the fastest one measured for a bf16 result too, so both take
+    it.
+
+    A 32-wide expert tile over 64 elements holds the kernel's shared memory
+    well inside the 64 KB that the narrowest of the seven chips offers.
     """
     bn = 32 if num_experts % 32 == 0 else 16
-    tiles = triton.cdiv(num_experts, bn)
-    if out_dtype == torch.float32:
-        bk = 128 if hidden_dim % 128 == 0 else 64
-        want = 56.0
-    else:
-        bk = 256 if hidden_dim % 256 == 0 else 128
-        want = max(1.0, 80 / tiles)
-    chunks = hidden_dim // bk
-    return bn, bk, _closest_divisor(chunks, want)
+    span = 512
+    while hidden_dim % span and span > 64:
+        span //= 2
+    groups = min(4, span // 64)
+    return bn, 64, hidden_dim // span, groups, span // (64 * groups)
 
 
 def dsv3_router_gemm(hidden_states, router_weights, out_dtype):
@@ -160,28 +150,7 @@ def dsv3_router_gemm(hidden_states, router_weights, out_dtype):
     out = torch.empty(
         (num_tokens, num_experts), dtype=out_dtype, device=device
     )
-    bn, bk, splits = _plan(num_tokens, num_experts, hidden_dim, out_dtype)
-    strides = (*hidden_states.stride(), *router_weights.stride())
-    rows = 16
-    if splits == 1:
-        _router_direct.run(
-            hidden_states,
-            router_weights,
-            out,
-            num_tokens,
-            num_experts,
-            hidden_dim,
-            *strides,
-            rows,
-            bn,
-            bk,
-            hidden_dim // bk,
-            grid=(triton.cdiv(num_experts, bn),),
-            warmup=False,
-            num_warps=4,
-            num_stages=2,
-        )
-        return out
+    bn, bk, splits, groups, steps = _plan(num_experts, hidden_dim)
     partial = torch.empty(
         (splits, num_tokens, num_experts), dtype=torch.float32, device=device
     )
@@ -192,12 +161,14 @@ def dsv3_router_gemm(hidden_states, router_weights, out_dtype):
         num_tokens,
         num_experts,
         hidden_dim,
-        *strides,
-        rows,
+        *hidden_states.stride(),
+        *router_weights.stride(),
+        16,
         bn,
         bk,
         splits,
-        hidden_dim // (bk * splits),
+        groups,
+        steps,
         grid=(triton.cdiv(num_experts, bn), splits),
         warmup=False,
         num_warps=4,
