@@ -172,8 +172,13 @@ def fused_qk_complex_rope(q, k, freqs_cis):
     heads = shape[-2]
     dim = shape[-1]
     half = dim // 2
-    q_flat = q if q.ndim == 3 else q.view(-1, heads, dim)
-    k_flat = k if k.ndim == 3 else k.view(-1, heads, dim)
+    # A view of a QKV projection keeps its token stride, so a three
+    # dimensional input is taken as it is and its strides are handed in.
+    # Anything deeper has its leading dimensions flattened into one;
+    # reshape returns a view when they collapse into a single stride and
+    # copies when they do not, which view reports as an error instead.
+    q_flat = q if q.ndim == 3 else q.reshape(-1, heads, dim)
+    k_flat = k if k.ndim == 3 else k.reshape(-1, heads, dim)
     # A complex64 row is a pair of FP32 words, and the view of it as
     # floats keeps whatever strides the frequencies arrived with, which
     # a slice of a wider table need not make contiguous. Only leading

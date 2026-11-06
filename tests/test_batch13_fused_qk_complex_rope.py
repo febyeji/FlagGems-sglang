@@ -247,3 +247,64 @@ def test_fused_qk_complex_rope_odd_storage_offset(backend, dtype, _tol):
     assert q.storage_offset() % 2 == 1 and q.stride(-1) == 1
     _, _, freqs_cis = make((tokens, heads, dim), dtype=dtype, seed=29)
     assert_matches(load(backend), (q, k, freqs_cis))
+
+
+def every_other(x):
+    """A view of `x` along a new leading dimension, every second entry.
+
+    Its two leading dimensions do not collapse into one stride, so the
+    flattening a kernel does to reach a token has to copy rather than
+    reinterpret.
+    """
+    wide = torch.empty(
+        x.shape[0] * 2, *x.shape[1:], dtype=x.dtype, device=x.device
+    )
+    wide[::2] = x
+    wide[1::2] = x.flip(-1)
+    view = wide[::2]
+    assert view.stride(0) != view.shape[1] * view.stride(1)
+    return view
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype,_tol", TOLERANCE)
+@pytest.mark.parametrize("strided", [False, True])
+def test_fused_qk_complex_rope_spread_leading_dims(
+    backend, dtype, _tol, strided
+):
+    # The leading dimensions carry no contract: they may be a slice of
+    # something wider and not lie end to end in memory. The task's
+    # reference computes such an input, so the operator does too.
+    q, k, freqs_cis = make(
+        (3, 4, 5, 64), dtype=dtype, strided=strided, seed=31
+    )
+    assert_matches(
+        load(backend),
+        (every_other(q), every_other(k), every_other(freqs_cis)),
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype,_tol", TOLERANCE)
+def test_fused_qk_complex_rope_broadcast_tokens(backend, dtype, _tol):
+    # An expanded tensor repeats one token with a stride of zero, which
+    # is a layout the kernel reads rather than a shape it rejects.
+    q, k, freqs_cis = make((1, 4, 64), dtype=dtype, seed=37)
+    tokens = 6
+    assert_matches(
+        load(backend),
+        (
+            q.expand(tokens, 4, 64),
+            k.expand(tokens, 4, 64),
+            freqs_cis.expand(tokens, 32),
+        ),
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_fused_qk_complex_rope_no_tokens(backend):
+    # An empty leading dimension has nothing to launch over.
+    q, k, freqs_cis = make((0, 4, 64), seed=41)
+    q_out, k_out = load(backend)(q, k, freqs_cis)
+    assert q_out.shape == q.shape and k_out.shape == k.shape
+    assert q_out.dtype == q.dtype and q_out.is_contiguous()
