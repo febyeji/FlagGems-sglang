@@ -204,6 +204,51 @@ def test_bias_gelu_tanh_on_another_device(backend, dtype, _tol, shape):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype,_tol", TOLERANCE)
+@pytest.mark.parametrize("offset", [1, 3, 7])
+def test_bias_gelu_tanh_unaligned_inputs(backend, dtype, _tol, offset):
+    # A launcher that holds a compiled kernel holds one that Triton
+    # specialized on 16-byte aligned pointers. A view into the middle of
+    # an allocation is not aligned, and has to reach a kernel that makes
+    # no such assumption.
+    device = "cuda"
+    rows, h = 8, 512
+    g = torch.Generator(device=device).manual_seed(11)
+
+    def buffer(n):
+        return (
+            torch.randn(n + 8, generator=g, device=device, dtype=torch.float32)
+        ).to(dtype)
+
+    x = buffer(rows * h)[offset : offset + rows * h].view(rows, h)
+    bias = buffer(h)[offset : offset + h]
+    assert x.is_contiguous() and bias.is_contiguous()
+    # Two bytes an element, so an odd offset lands off the boundary.
+    assert x.data_ptr() % 16 and bias.data_ptr() % 16
+    assert_matches(load(backend), (x, bias))
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype,_tol", TOLERANCE)
+def test_bias_gelu_tanh_second_device_is_current(backend, dtype, _tol):
+    # A compiled kernel belongs to the device it was loaded on, so a
+    # launcher that holds one has to hold it per device. This runs the
+    # whole call on the second device, after the first has been used.
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs a second device to be somewhere else")
+    current = torch.cuda.current_device()
+    other = (current + 1) % torch.cuda.device_count()
+    solution = load(backend)
+    solution(*make((128, 256), dtype=dtype, seed=2))
+    with torch.cuda.device(other):
+        case = make((128, 256), dtype=dtype, seed=2)
+        assert case[0].device.index == other
+        assert_matches(solution, case)
+    # and back, so the two devices' kernels are both exercised
+    assert_matches(solution, make((128, 256), dtype=dtype, seed=2))
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("scale", [1.0, 8.0, 64.0])
 def test_bias_gelu_tanh_magnitudes(backend, scale):
     # Activations entering a bias-GELU are not all near one, and the

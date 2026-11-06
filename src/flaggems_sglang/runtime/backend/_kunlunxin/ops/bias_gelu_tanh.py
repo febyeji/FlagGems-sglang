@@ -23,9 +23,12 @@ of about 3.4e-4 of the input at the negative tail, which passes a
 normal-distributed correctness case and fails an input of a few hundred.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
+from triton.runtime import driver
 
 __all__ = ["bias_gelu_tanh"]
 
@@ -100,6 +103,46 @@ def _pick_block(total):
     return block, total % block == 0
 
 
+@functools.lru_cache(maxsize=None)
+def _compiled(dtype, h, block, wide, device):
+    """The compiled exact kernel for one specialization, or None.
+
+    `JITFunction.run` rebinds the arguments and rebuilds the
+    specialization key on every call before it reaches the launcher,
+    which is 14 of the 38 microseconds a small call takes on one RTX
+    3090. It hands back the compiled kernel, and that kernel can be
+    entered directly, so the launcher keeps one per specialization.
+
+    Everything the kernel is specialized on is in the key: the dtype,
+    the three compile-time constants and the device. The one dimension
+    that is not an argument here is whether Triton may assume 16-byte
+    aligned pointers, which the caller settles by taking this path only
+    for pointers that are aligned, as the probes below are. Nothing
+    about a call's data is kept — this is the compiled kernel, the same
+    object Triton's own cache holds.
+
+    A backend whose `run` does not hand the kernel back returns None
+    here and keeps the ordinary path.
+    """
+    probe = torch.empty(block, dtype=dtype, device=device)
+    row = torch.empty(h, dtype=dtype, device=device)
+    kernel = _bias_gelu_tanh_exact.run(
+        probe,
+        row,
+        probe,
+        h,
+        block,
+        wide,
+        grid=(1,),
+        warmup=False,
+        num_warps=4,
+        num_stages=1,
+    )
+    if kernel is None or not hasattr(kernel, "__getitem__"):
+        return None
+    return kernel
+
+
 def _launch(src, row, out, h, total, block, exact, wide):
     """Enter the kernel, counting the grid out in plain Python."""
     if exact:
@@ -152,12 +195,27 @@ def bias_gelu_tanh(x, bias):
     # pointer it cannot reach from there, so an input that lives
     # elsewhere has to make its own device current first. Asking is
     # cheaper than guarding, and this backend reaches torch as `cuda`.
-    device_fn = torch.cuda if src.is_cuda else getattr(torch, src.device.type)
-    if device_fn.current_device() == src.get_device():
-        _launch(src, row, out, h, total, block, exact, wide)
-    else:
-        with device_fn.device(src.device):
+    dev = src.device
+    device_fn = torch.cuda if src.is_cuda else getattr(torch, dev.type)
+    if device_fn.current_device() != dev.index:
+        with device_fn.device(dev):
             _launch(src, row, out, h, total, block, exact, wide)
+        return out
+    # The held kernel takes the mask-free path with aligned pointers,
+    # which is every shape whose element count a block divides. The
+    # output is a fresh allocation and so always aligned; the inputs
+    # are the caller's and may be a view that is not.
+    if exact and ((src.data_ptr() | row.data_ptr()) & 15) == 0:
+        kernel = _compiled(src.dtype, h, block, wide, dev)
+        if kernel is not None:
+            kernel[(total // block, 1, 1)](
+                src,
+                row,
+                out,
+                stream=driver.active.get_current_stream(dev.index),
+            )
+            return out
+    _launch(src, row, out, h, total, block, exact, wide)
     return out
 
 
