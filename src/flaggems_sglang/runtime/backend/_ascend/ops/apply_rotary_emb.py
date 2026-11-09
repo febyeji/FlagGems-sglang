@@ -89,9 +89,12 @@ def _rows(
         if SHARED:
             pair = tl.arange(0, PAIRS)
             narrow = pair[:, None] * 2 + part[None, :]
-            f = tl.load(
-                F + position * FS + narrow, narrow < D, other=0.0
-            )
+            fmask = narrow < D
+            if BLOCKS % GRID != 0:
+                # A trailing pass sits on blocks past the table's rows, so
+                # the read needs the block mask too.
+                fmask = fmask & keep
+            f = tl.load(F + position * FS + narrow, fmask, other=0.0)
             if ROWS == 1:
                 f_real = tl.sum(f * take_real, 1)
                 f_imag = tl.sum(f * take_imag, 1)
