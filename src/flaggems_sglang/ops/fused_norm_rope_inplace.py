@@ -32,33 +32,52 @@ def _rotate_rows(
     # whole row goes out in one contiguous store. When the tail starts on
     # an odd column the grid of pairs starts one column early.
     SHIFT: tl.constexpr = (D - R) % 2
+    # When the tile is exactly the row and the rows divide among the
+    # programs, every access is inside the row and only the table, which
+    # covers the tail alone, still needs a mask.
+    EXACT: tl.constexpr = (2 * PAIRS == D) and (M % ROWS == 0)
     row = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
     pair = tl.arange(0, PAIRS)
     part = tl.arange(0, 2)
     column = pair[None, :, None] * 2 + part[None, None, :] - SHIFT
     inside = (column >= 0) & (column < D)
     live = (row[:, None, None] < M) & inside
-    x = tl.load(KV + row[:, None, None] * S + column, live, other=0.0).to(
-        tl.float32
-    )
+    if EXACT:
+        x = tl.load(KV + row[:, None, None] * S + column).to(tl.float32)
+    else:
+        x = tl.load(KV + row[:, None, None] * S + column, live, other=0.0).to(
+            tl.float32
+        )
     inv = tl.rsqrt(tl.sum(tl.sum(x * x, 2), 1) / D + EPS)
     y = x * inv[:, None, None]
     if HAS_W:
-        y = y * tl.load(W + column, inside, other=0.0).to(tl.float32)
+        if EXACT:
+            y = y * tl.load(W + column).to(tl.float32)
+        else:
+            y = y * tl.load(W + column, inside, other=0.0).to(tl.float32)
     if HAS_P:
-        position = tl.load(P + row, row < M, other=0).to(tl.int64)
+        if EXACT:
+            position = tl.load(P + row).to(tl.int64)
+        else:
+            position = tl.load(P + row, row < M, other=0).to(tl.int64)
     else:
         position = row
     tail = pair - (D - R + SHIFT) // 2
     rotated = (tail >= 0) & (tail < R // 2)
-    f = tl.load(
+    table = (
         F
         + position[:, None, None] * FS
         + tail[None, :, None] * 2
-        + part[None, None, :],
-        (row[:, None, None] < M) & rotated[None, :, None],
-        other=0.0,
+        + part[None, None, :]
     )
+    if EXACT:
+        f = tl.load(table, rotated[None, :, None], other=0.0)
+    else:
+        f = tl.load(
+            table,
+            (row[:, None, None] < M) & rotated[None, :, None],
+            other=0.0,
+        )
     real = part[None, None, :] == 0
     f_real = tl.sum(tl.where(real, f, 0.0), 2)
     f_imag = tl.sum(tl.where(real, 0.0, f), 2)
@@ -70,11 +89,17 @@ def _rotate_rows(
         (y_real * f_real - y_imag * f_imag)[:, :, None],
         (y_real * f_imag + y_imag * f_real)[:, :, None],
     )
-    tl.store(
-        OUT + row[:, None, None] * D + column,
-        out.to(OUT.dtype.element_ty),
-        live,
-    )
+    if EXACT:
+        tl.store(
+            OUT + row[:, None, None] * D + column,
+            out.to(OUT.dtype.element_ty),
+        )
+    else:
+        tl.store(
+            OUT + row[:, None, None] * D + column,
+            out.to(OUT.dtype.element_ty),
+            live,
+        )
 
 
 def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
@@ -105,7 +130,15 @@ def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
     if m:
         r = freqs_cis.shape[-1] * 2
         pairs = 1 << ((d + (d - r) % 2 + 1) // 2 - 1).bit_length()
-        rows = max(1, min(8, 512 // pairs))
+        # The vendor chips dispatch programs one at a time, so a narrow
+        # row wants more rows to a program than this card does: v8 cut
+        # 333x128 from eight rows a program to one and muxi fell from
+        # 7.33 to 4.85. Wide rows keep what graded best.
+        rows = (
+            max(1, min(16, 2048 // (2 * pairs)))
+            if 2 * pairs <= 256
+            else max(1, min(8, 512 // pairs))
+        )
         _rotate_rows.run(
             kv,
             weight,
