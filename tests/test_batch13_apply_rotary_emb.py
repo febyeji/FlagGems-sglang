@@ -248,3 +248,27 @@ def test_apply_rotary_emb_repeated_positions(backend):
         reference(x, freqs_cis, pos, False),
         **TOLERANCE[x.dtype],
     )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("heads", [None, 8])
+def test_apply_rotary_emb_strided_positions(backend, heads):
+    # Positions sliced out of a longer tensor keep a stride over 1.
+    x, freqs_cis, _ = make(64, 64, heads=heads)
+    pos = torch.randint(0, 4096, (128,), device="cuda", dtype=torch.int64)[::2]
+    torch.testing.assert_close(
+        load(backend)(x, freqs_cis, pos, False),
+        reference(x, freqs_cis, pos, False),
+        **TOLERANCE[x.dtype],
+    )
+    # The exact case the review reproduced.
+    x = torch.ones((2, 2), device="cuda", dtype=torch.float32)
+    f = torch.tensor(
+        [[1 + 0j], [0 + 1j], [-1 + 0j]], device="cuda", dtype=torch.complex64
+    )
+    p = torch.tensor([0, 2, 1, 2], device="cuda", dtype=torch.int64)[::2]
+    torch.testing.assert_close(
+        load(backend)(x, f, p, False),
+        reference(x, f, p, False),
+        **TOLERANCE[torch.float32],
+    )

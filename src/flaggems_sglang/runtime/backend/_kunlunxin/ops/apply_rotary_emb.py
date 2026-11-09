@@ -19,6 +19,7 @@ def _row(
     SX0: tl.constexpr,
     SX1: tl.constexpr,
     FS: tl.constexpr,
+    PS: tl.constexpr,
     HAS_P: tl.constexpr,
     INVERSE: tl.constexpr,
     B: tl.constexpr,
@@ -53,7 +54,7 @@ def _row(
     following = tl.load(source + 1, to_next, other=0.0).to(tl.float32)
     partner = prior * odd + following * even
     if HAS_P:
-        position = tl.load(P + token).to(tl.int64)
+        position = tl.load(P + token * PS).to(tl.int64)
     else:
         position = token
     # The table is interleaved like the row, so element c of the row reads
@@ -108,6 +109,7 @@ def apply_rotary_emb(x, freqs_cis, positions, inverse):
             x.stride(0),
             x.stride(1) if x.ndim == 3 else 0,
             freqs.stride(0),
+            positions.stride(0) if positions is not None else 0,
             positions is not None,
             inverse,
             b,

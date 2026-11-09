@@ -28,6 +28,7 @@ def _rows(
     SX0: tl.constexpr,
     SX1: tl.constexpr,
     FS: tl.constexpr,
+    PS: tl.constexpr,
     HAS_P: tl.constexpr,
     INVERSE: tl.constexpr,
     SHARED: tl.constexpr,
@@ -64,14 +65,14 @@ def _rows(
         if BLOCKS % GRID == 0:
             mask = lane < ROWS * D
             if HAS_P:
-                position = tl.load(P + token).to(tl.int64)
+                position = tl.load(P + token * PS).to(tl.int64)
             else:
                 position = token
         else:
             keep = block < BLOCKS
             mask = (lane < ROWS * D) & keep
             if HAS_P:
-                position = tl.load(P + token, keep, other=0).to(tl.int64)
+                position = tl.load(P + token * PS, keep, other=0).to(tl.int64)
             else:
                 position = token
         x = tl.load(
@@ -162,6 +163,7 @@ def apply_rotary_emb(x, freqs_cis, positions, inverse):
             x.stride(0),
             x.stride(1) if x.ndim == 3 else 0,
             freqs.stride(0),
+            positions.stride(0) if positions is not None else 0,
             positions is not None,
             inverse,
             rows == 1 or heads % rows == 0,

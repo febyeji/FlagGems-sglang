@@ -23,6 +23,7 @@ def _rotate(
     SX0: tl.constexpr,
     SX1: tl.constexpr,
     FS: tl.constexpr,
+    PS: tl.constexpr,
     HAS_P: tl.constexpr,
     INVERSE: tl.constexpr,
     FLAT: tl.constexpr,
@@ -58,7 +59,7 @@ def _rotate(
                 X + base[:, None, None] + column, column < D, other=0.0
             ).to(tl.float32)
         if HAS_P:
-            position = tl.load(P + token).to(tl.int64)
+            position = tl.load(P + token * PS).to(tl.int64)
         else:
             position = token
     else:
@@ -71,7 +72,7 @@ def _rotate(
             tl.float32
         )
         if HAS_P:
-            position = tl.load(P + token, live, other=0).to(tl.int64)
+            position = tl.load(P + token * PS, live, other=0).to(tl.int64)
         else:
             position = token
     # The table is interleaved like the row: (real, imag) per pair.
@@ -142,6 +143,7 @@ def apply_rotary_emb(x, freqs_cis, positions, inverse):
             x.stride(0),
             stride_head,
             freqs.stride(0),
+            positions.stride(0) if positions is not None else 0,
             positions is not None,
             inverse,
             x.stride(0) == heads * d and stride_head in (0, d),
