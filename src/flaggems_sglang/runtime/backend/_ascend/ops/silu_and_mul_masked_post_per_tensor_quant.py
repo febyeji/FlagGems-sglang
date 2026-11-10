@@ -7,6 +7,12 @@ import triton.language as tl
 
 __all__ = ["silu_and_mul_masked_post_per_tensor_quant"]
 
+# Rows per iteration are fixed at one: this chip's compiler takes an affine
+# store, not a gathered one, so the row has to stay a scalar. The grid is
+# the width that paid off on the paged-KV writer here; the chip charges per
+# tile iteration, and the count of those is the same whatever the grid, so
+# a wide one only helps the scheduler balance it.
+PROGRAMS = 1024
 BLOCK = 1024
 
 
@@ -35,37 +41,42 @@ def _silu_quant(
     Y,
     T: tl.constexpr,
     H: tl.constexpr,
-    TOTAL: tl.constexpr,
-    WIDE: tl.constexpr,
+    ROWS: tl.constexpr,
     PROGRAMS: tl.constexpr,
+    GRID: tl.constexpr,
+    CHUNKS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # Laid out like the Ascend kernels that already compile on this chip: a
-    # flat index over the output bytes, a one-dimensional grid and a
-    # grid-stride loop with a compile-time trip count. The input row of an
-    # output byte is the row of the contiguous [E, T, 2H] layout, and its
-    # up half sits H columns to the right, so only masked_m needs the
-    # expert index.
+    # One program walks every GRID-th row with a compile-time trip count,
+    # and within a row sweeps the half row in BLOCK-wide tiles. The up half
+    # of an input row sits H columns to the right of the gate half.
     pid = tl.program_id(0)
-    if WIDE:
-        pid = pid.to(tl.int64)
     lane = tl.arange(0, BLOCK)
     s = tl.load(S)
-    for step in range(triton.cdiv(TOTAL, PROGRAMS * BLOCK)):
-        index = (step * PROGRAMS + pid) * BLOCK + lane
-        valid = index < TOTAL
-        row = index // H
-        column = index - row * H
-        expert = row // T
-        token = row - expert * T
-        kept = valid & (token < tl.load(M + expert, valid, 0))
-        base = row.to(tl.int64) * (2 * H)
-        gate = tl.load(X + base + column, kept, other=0.0).to(tl.float32)
-        up = tl.load(X + base + H + column, kept, other=0.0).to(tl.float32)
-        val = gate * (1.0 / (1.0 + tl.exp(-gate))) * up
-        # Masked rows read zeros and so encode to a zero byte, which is what
-        # the reference leaves there.
-        tl.store(Y + index, _encode_fp8(tl.div_rn(val, s)), valid)
+    for chunk in range(CHUNKS):
+        row = pid + chunk * GRID
+        if row < ROWS:
+            expert = row // T
+            token = row - expert * T
+            # Masked rows read zeros and so encode to a zero byte, which is
+            # what the reference leaves there.
+            keep = token < tl.load(M + expert)
+            base = row.to(tl.int64) * (2 * H)
+            for tile in range(tl.cdiv(H, BLOCK)):
+                col = tile * BLOCK + lane
+                m = col < H
+                gate = tl.load(X + base + col, m & keep, other=0.0).to(
+                    tl.float32
+                )
+                up = tl.load(X + base + H + col, m & keep, other=0.0).to(
+                    tl.float32
+                )
+                val = gate * (1.0 / (1.0 + tl.exp(-gate))) * up
+                tl.store(
+                    Y + row.to(tl.int64) * H + col,
+                    _encode_fp8(tl.div_rn(val, s)),
+                    m,
+                )
 
 
 def silu_and_mul_masked_post_per_tensor_quant(input, masked_m, scale):
@@ -77,15 +88,15 @@ def silu_and_mul_masked_post_per_tensor_quant(input, masked_m, scale):
         dtype=torch.float8_e4m3fn,
         device=input.device,
     )
-    total = experts * tokens * half
-    if total:
+    rows = experts * tokens
+    if rows and half:
         if not input.is_contiguous():
             input = input.contiguous()
         if not masked_m.is_contiguous():
             masked_m = masked_m.contiguous()
         if not scale.is_contiguous():
             scale = scale.contiguous()
-        programs = min(1024, (total + BLOCK - 1) // BLOCK)
+        grid = min(rows, PROGRAMS)
         _silu_quant.run(
             input,
             masked_m,
@@ -93,11 +104,12 @@ def silu_and_mul_masked_post_per_tensor_quant(input, masked_m, scale):
             out.view(torch.uint8),
             tokens,
             half,
-            total,
-            total >= 2**31,
-            programs,
+            rows,
+            PROGRAMS,
+            grid,
+            (rows + grid - 1) // grid,
             BLOCK,
-            grid=(programs,),
+            grid=(grid,),
             warmup=False,
             num_warps=4,
             num_stages=1,
