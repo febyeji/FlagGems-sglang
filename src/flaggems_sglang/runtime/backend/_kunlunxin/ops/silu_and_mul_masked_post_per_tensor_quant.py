@@ -10,7 +10,7 @@ __all__ = ["silu_and_mul_masked_post_per_tensor_quant"]
 # Words per program. The XPU scratchpad rejects wide tiles, and the chip
 # runs a grid-stride loop slower than it runs more programs, so the tile
 # stays narrow and the grid stays large.
-BLOCK = 256
+BLOCK = 512
 
 
 @triton.jit

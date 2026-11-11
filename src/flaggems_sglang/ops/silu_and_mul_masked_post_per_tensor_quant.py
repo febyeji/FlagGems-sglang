@@ -93,6 +93,15 @@ def silu_and_mul_masked_post_per_tensor_quant(input, masked_m, scale):
         # triton.next_power_of_2 and triton.cdiv are JIT functions in Triton
         # 3.9 and cost about 9 us each on the host; compute them in Python.
         block = 1 << (min(half, 1024) - 1).bit_length()
+        # A block wider than the half row pads the tile with masked lanes
+        # that still run the silu: shrink the block while it strictly cuts
+        # the padded lane count (H=1408: 2048 lanes at 1024, 1536 at 512).
+        while block > 256:
+            narrow = block // 2
+            if -(-half // narrow) * narrow < -(-half // block) * block:
+                block = narrow
+            else:
+                break
         rows = max(1, 2048 // block)
         total = experts * tokens
         _silu_quant.run(
