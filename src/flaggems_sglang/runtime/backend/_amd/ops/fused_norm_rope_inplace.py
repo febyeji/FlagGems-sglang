@@ -12,6 +12,14 @@ __all__ = ["fused_norm_rope_inplace"]
 # this chip keeps four.
 
 
+# The row is read once and never read again, so it is fetched past the L1,
+# and the output is never read at all, so it is written through. The weight
+# and the table keep the default policy: every program reads the same few
+# lines of those. Measured on this grader family in YEJ-357, the pair was
+# worth 14.4% on card B and about 9% on card A, and 22.7% against on
+# tianshu, so tianshu's file does not carry it.
+
+
 @triton.jit
 def _rotate_rows(
     KV,
@@ -47,11 +55,16 @@ def _rotate_rows(
     inside = (column >= 0) & (column < D)
     live = (row[:, None, None] < M) & inside
     if EXACT:
-        x = tl.load(KV + row[:, None, None] * S + column).to(tl.float32)
+        x = tl.load(
+            KV + row[:, None, None] * S + column, cache_modifier=".cg"
+        ).to(tl.float32)
     else:
-        x = tl.load(KV + row[:, None, None] * S + column, live, other=0.0).to(
-            tl.float32
-        )
+        x = tl.load(
+            KV + row[:, None, None] * S + column,
+            live,
+            other=0.0,
+            cache_modifier=".cg",
+        ).to(tl.float32)
     inv = tl.rsqrt(tl.sum(tl.sum(x * x, 2), 1) / D + EPS)
     y = x * inv[:, None, None]
     if HAS_W:
@@ -97,12 +110,14 @@ def _rotate_rows(
         tl.store(
             OUT + row[:, None, None] * D + column,
             out.to(OUT.dtype.element_ty),
+            cache_modifier=".cs",
         )
     else:
         tl.store(
             OUT + row[:, None, None] * D + column,
             out.to(OUT.dtype.element_ty),
             live,
+            cache_modifier=".cs",
         )
 
 
