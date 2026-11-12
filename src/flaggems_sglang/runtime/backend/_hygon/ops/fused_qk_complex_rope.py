@@ -20,6 +20,17 @@ __all__ = ["fused_qk_complex_rope"]
 # the graded shapes also include a single token, where the block shrinks
 # to one head row of 64 words and four warps leave three lanes in four
 # with nothing to read.
+#
+# The row of words is read once and never read again, so it is fetched
+# past the L1; the output is never read at all, so it is written
+# through. The frequency row keeps the default policy, because every
+# head in the program reads it. In `bias_gelu_tanh` this chip stayed
+# inside its spread with the same pair of hints while general-purpose
+# chip B gained 14% and tianshu lost 21% (YEJ-357, 2026-11-12), so the
+# iluvatar file does not carry them; here the chip is 2.8% behind this
+# task's first place, which one draw's spread covers. The strided
+# path, which no graded shape takes, keeps the default policy.
+
 TILE = 4096
 PROGRAMS = 1024
 WORDS_PER_WARP = 64
@@ -96,10 +107,14 @@ def _fused_qk_complex_rope_kernel(
         # A pair is one word, so the row is one contiguous run of them
         # and the pointers arrive already viewed as words.
         q_word = tl.load(
-            Q + token * QT + head * QH + pair[None, :], mask=mask
+            Q + token * QT + head * QH + pair[None, :],
+            mask=mask,
+            cache_modifier=".cg",
         )
         k_word = tl.load(
-            K + token * KT + head * KH + pair[None, :], mask=mask
+            K + token * KT + head * KH + pair[None, :],
+            mask=mask,
+            cache_modifier=".cg",
         )
         q_real = _low(q_word, BF16)
         q_imag = _high(q_word, BF16)
@@ -121,8 +136,18 @@ def _fused_qk_complex_rope_kernel(
     k_imag_out = k_real * sin + k_imag * cos
     if WORDS:
         out = token * (HEADS * HALF) + head * HALF + pair[None, :]
-        tl.store(QO + out, _pack(q_real_out, q_imag_out, BF16), mask=mask)
-        tl.store(KO + out, _pack(k_real_out, k_imag_out, BF16), mask=mask)
+        tl.store(
+            QO + out,
+            _pack(q_real_out, q_imag_out, BF16),
+            mask=mask,
+            cache_modifier=".cs",
+        )
+        tl.store(
+            KO + out,
+            _pack(k_real_out, k_imag_out, BF16),
+            mask=mask,
+            cache_modifier=".cs",
+        )
     else:
         out = (
             token * (HEADS * 2 * HALF)
