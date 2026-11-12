@@ -20,6 +20,11 @@ __all__ = ["fused_norm_rope_inplace"]
 # tianshu, so tianshu's file does not carry it.
 
 
+# The table is indexed by the row's own position, so on the graded shapes
+# each program reads table lines no other program reads; it is hinted like
+# the row. The weight keeps the default policy: every program reads it.
+
+
 @triton.jit
 def _rotate_rows(
     KV,
@@ -88,12 +93,15 @@ def _rotate_rows(
         + part[None, None, :]
     )
     if EXACT:
-        f = tl.load(table, rotated[None, :, None], other=0.0)
+        f = tl.load(
+            table, rotated[None, :, None], other=0.0, cache_modifier=".cg"
+        )
     else:
         f = tl.load(
             table,
             (row[:, None, None] < M) & rotated[None, :, None],
             other=0.0,
+            cache_modifier=".cg",
         )
     real = part[None, None, :] == 0
     f_real = tl.sum(tl.where(real, f, 0.0), 2)

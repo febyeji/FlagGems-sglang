@@ -17,7 +17,7 @@ CORES = 40
     do_not_specialize=["KV", "W", "F", "P", "OUT"],
     do_not_specialize_on_alignment=["KV", "W", "F", "P", "OUT"],
 )
-def _rows(
+def _blocks(
     KV,
     W,
     F,
@@ -33,23 +33,25 @@ def _rows(
     HAS_P: tl.constexpr,
     BH: tl.constexpr,
     HP: tl.constexpr,
+    ROWS: tl.constexpr,
     GRID: tl.constexpr,
     CHUNKS: tl.constexpr,
 ):
-    # The trip count is fixed at compile time and each pass takes one row
-    # with a scalar index, which is the shape this chip's compiler takes.
+    # The trip count is fixed at compile time and each pass takes ROWS rows
+    # as one tile, the shape the merged RMSNorm+RoPE kernels use on this
+    # chip: 2-D loads, one reduction along the row axis, 2-D stores.
     #
     # The row is two contiguous blocks, the part before the rope tail and
-    # the tail as [pairs, 2], each read once and written once under a mask
-    # that is an upper bound. Stride-2 stores into the tail left it wrong
-    # here, and reads shifted by one element are misaligned, so the halves
-    # of each pair are taken apart and put back together in registers: a
-    # product with a 0/1 selector summed over the pair is exact.
+    # the tail as [rows, pairs, 2], each read once and written once. The
+    # halves of each pair are taken apart and put back together in
+    # registers: a product with a 0/1 selector summed over the pair is
+    # exact, and every access stays a contiguous block.
     N: tl.constexpr = D - R
     head = tl.arange(0, BH)
     pair = tl.arange(0, HP)
     part = tl.arange(0, 2)
     lane = pair[:, None] * 2 + part[None, :]
+    rows_in_tile = tl.arange(0, ROWS)
     take_real = (part == 0).to(tl.float32)[None, :]
     take_imag = (part == 1).to(tl.float32)[None, :]
     if HAS_W:
@@ -57,57 +59,60 @@ def _rows(
             w_head = tl.load(W + head, head < N, other=0.0).to(tl.float32)
         w_tail = tl.load(W + N + lane, lane < R, other=0.0).to(tl.float32)
     for chunk in range(CHUNKS):
-        row = (tl.program_id(0) + chunk * GRID).to(tl.int64)
-        # The rows divide among the programs when M is a multiple of GRID,
-        # and then no access needs a row mask.
-        if M % GRID == 0:
-            head_mask = head < N
-            tail_mask = lane < R
-            if HAS_P:
-                position = tl.load(P + row).to(tl.int64)
-            else:
-                position = row
+        row = (
+            tl.program_id(0) + chunk * GRID
+        ).to(tl.int64) * ROWS + rows_in_tile.to(tl.int64)
+        live = row < M
+        head_mask = live[:, None] & (head < N)[None, :]
+        tail_mask = live[:, None, None] & (lane < R)[None, :, :]
+        if HAS_P:
+            position = tl.load(P + row, live, other=0).to(tl.int64)
         else:
-            live = row < M
-            head_mask = (head < N) & live
-            tail_mask = (lane < R) & live
-            if HAS_P:
-                position = tl.load(P + row, live, other=0).to(tl.int64)
-            else:
-                position = row
-        x_tail = tl.load(KV + row * S + N + lane, tail_mask, other=0.0).to(
-            tl.float32
-        )
-        squares = tl.sum(tl.sum(x_tail * x_tail, 1), 0)
+            position = row
+        x_tail = tl.load(
+            KV + row[:, None, None] * S + (N + lane)[None, :, :],
+            tail_mask,
+            other=0.0,
+        ).to(tl.float32)
+        squares = tl.sum(tl.sum(x_tail * x_tail, 2), 1)
         if N > 0:
-            x_head = tl.load(KV + row * S + head, head_mask, other=0.0).to(
-                tl.float32
-            )
-            squares += tl.sum(x_head * x_head, 0)
+            x_head = tl.load(
+                KV + row[:, None] * S + head[None, :], head_mask, other=0.0
+            ).to(tl.float32)
+            squares += tl.sum(x_head * x_head, 1)
         inv = tl.rsqrt(squares / D + EPS)
         if N > 0:
-            y_head = x_head * inv
+            y_head = x_head * inv[:, None]
             if HAS_W:
-                y_head = y_head * w_head
+                y_head = y_head * w_head[None, :]
             tl.store(
-                OUT + row * D + head,
+                OUT + row[:, None] * D + head[None, :],
                 y_head.to(OUT.dtype.element_ty),
                 head_mask,
             )
-        y_tail = x_tail * inv
+        y_tail = x_tail * inv[:, None, None]
         if HAS_W:
-            y_tail = y_tail * w_tail
-        y_real = tl.sum(y_tail * take_real, 1)
-        y_imag = tl.sum(y_tail * take_imag, 1)
+            y_tail = y_tail * w_tail[None, :, :]
+        y_real = tl.sum(y_tail * take_real[None, :, :], 2)
+        y_imag = tl.sum(y_tail * take_imag[None, :, :], 2)
         # The table is interleaved like the row: (real, imag) per pair.
-        f = tl.load(F + position * FS + lane, tail_mask, other=0.0)
-        f_real = tl.sum(f * take_real, 1)
-        f_imag = tl.sum(f * take_imag, 1)
+        f = tl.load(
+            F + position[:, None, None] * FS + lane[None, :, :],
+            tail_mask,
+            other=0.0,
+        )
+        f_real = tl.sum(f * take_real[None, :, :], 2)
+        f_imag = tl.sum(f * take_imag[None, :, :], 2)
         out_real = y_real * f_real - y_imag * f_imag
         out_imag = y_real * f_imag + y_imag * f_real
-        out = out_real[:, None] * take_real + out_imag[:, None] * take_imag
+        out = (
+            out_real[:, :, None] * take_real[None, :, :]
+            + out_imag[:, :, None] * take_imag[None, :, :]
+        )
         tl.store(
-            OUT + row * D + N + lane, out.to(OUT.dtype.element_ty), tail_mask
+            OUT + row[:, None, None] * D + (N + lane)[None, :, :],
+            out.to(OUT.dtype.element_ty),
+            tail_mask,
         )
 
 
@@ -134,8 +139,16 @@ def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
     out = torch.empty_like(kv)
     if m:
         half = freqs_cis.shape[-1]
-        grid = min(m, CORES)
-        _rows.run(
+        r = 2 * half
+        bh = 1 << max(d - r - 1, 0).bit_length()
+        hp = 1 << max(half - 1, 0).bit_length()
+        # Batch rows into one tile once there are more rows than cores, so
+        # every pass moves a full 2-D block instead of one row at a time.
+        rows = 1
+        while rows < 8 and rows * CORES * 2 <= m:
+            rows *= 2
+        grid = min((m + rows - 1) // rows, CORES)
+        _blocks.run(
             kv,
             weight,
             freqs,
@@ -143,18 +156,20 @@ def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
             out,
             m,
             d,
-            2 * half,
+            r,
             kv.stride(0),
             freqs.stride(0),
             eps,
             weight is not None,
             positions is not None,
-            1 << max(d - 2 * half - 1, 0).bit_length(),
-            1 << max(half - 1, 0).bit_length(),
+            bh,
+            hp,
+            rows,
             grid,
-            (m + grid - 1) // grid,
+            ((m + rows - 1) // rows + grid - 1) // grid,
             grid=(grid,),
             warmup=False,
+            num_warps=4,
         )
     return out
 
