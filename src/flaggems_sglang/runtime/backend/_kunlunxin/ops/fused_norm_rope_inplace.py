@@ -1,14 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Kunlunxin head/tail split: 576-wide rows take 576 lanes, not 1024.
-
-The generic kernel covers the row with one [pairs, 2] tile whose width is
-the next power of two of the row (1024 lanes for 576 columns). Here the
-nope head and the interleaved rope tail are separate exact tiles, as in
-the ascend kernel.
-"""
-
 import torch
 import triton
 import triton.language as tl
@@ -17,13 +9,12 @@ __all__ = ["fused_norm_rope_inplace"]
 
 
 @triton.jit
-def _split_rows(
+def _row(
     KV,
     W,
     F,
     P,
     OUT,
-    M: tl.constexpr,
     D: tl.constexpr,
     R: tl.constexpr,
     S: tl.constexpr,
@@ -31,132 +22,102 @@ def _split_rows(
     EPS: tl.constexpr,
     HAS_W: tl.constexpr,
     HAS_P: tl.constexpr,
-    BH: tl.constexpr,
-    HP: tl.constexpr,
-    ROWS: tl.constexpr,
+    B: tl.constexpr,
 ):
-    N: tl.constexpr = D - R
-    EXACT: tl.constexpr = (BH == N) and (M % ROWS == 0)
-    row = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
-    head = tl.arange(0, BH)
-    pair = tl.arange(0, HP)
-    part = tl.arange(0, 2)
-    lane = pair[None, :, None] * 2 + part[None, None, :]
-    if EXACT:
-        live_head = None
-        x_head = tl.load(KV + row[:, None] * S + head[None, :]).to(tl.float32)
-        x_tail = tl.load(
-            KV + row[:, None, None] * S + N + lane
-        ).to(tl.float32)
-    else:
-        live = row[:, None] < M
-        live_head = live & (head[None, :] < N)
-        live_tail = live[:, :, None] & (lane < R)
-        x_head = tl.load(
-            KV + row[:, None] * S + head[None, :], live_head, other=0.0
-        ).to(tl.float32)
-        x_tail = tl.load(
-            KV + row[:, None, None] * S + N + lane, live_tail, other=0.0
-        ).to(tl.float32)
-    squares = tl.sum(x_head * x_head, 1) + tl.sum(tl.sum(x_tail * x_tail, 2), 1)
-    inv = tl.rsqrt(squares / D + EPS)
-    y_head = x_head * inv[:, None]
-    y_tail = x_tail * inv[:, None, None]
+    # One program per row, as the SGLang kernel runs.
+    #
+    # Each output element is written once, by one contiguous store of the
+    # row: a masked store followed by stride-2 stores into the part it
+    # skipped left elements unwritten here. The other half of each
+    # (real, imag) pair is the same row read one element to the right or
+    # to the left, so every access is a contiguous block under a mask that
+    # is a single range, and the parity picks between the two afterwards.
+    row = tl.program_id(0).to(tl.int64)
+    column = tl.arange(0, B)
+    inside = column < D
+    t = column - (D - R)
+    tail = (column >= D - R) & inside
+    odd = (t & 1) == 1
+    to_next = (column >= D - R) & (column < D - 1)
+    to_prev = (column >= D - R + 1) & inside
+    source = KV + row * S + column
+    x = tl.load(source, inside, other=0.0).to(tl.float32)
+    inv = tl.rsqrt(tl.sum(x * x, 0) / D + EPS)
+    partner = tl.where(
+        odd,
+        tl.load(source - 1, to_prev, other=0.0),
+        tl.load(source + 1, to_next, other=0.0),
+    ).to(tl.float32)
+    y = x * inv
+    y_pair = partner * inv
     if HAS_W:
-        if EXACT:
-            y_head = y_head * tl.load(W + head).to(tl.float32)
-            y_tail = y_tail * tl.load(W + N + lane).to(tl.float32)
-        else:
-            y_head = y_head * tl.load(
-                W + head, head < N, other=0.0
-            ).to(tl.float32)
-            y_tail = y_tail * tl.load(
-                W + N + lane, lane < R, other=0.0
-            ).to(tl.float32)
+        y = y * tl.load(W + column, inside, other=0.0).to(tl.float32)
+        y_pair = y_pair * tl.where(
+            odd,
+            tl.load(W + column - 1, to_prev, other=0.0),
+            tl.load(W + column + 1, to_next, other=0.0),
+        ).to(tl.float32)
     if HAS_P:
-        if EXACT:
-            position = tl.load(P + row).to(tl.int64)
-        else:
-            position = tl.load(P + row, row < M, other=0).to(tl.int64)
+        position = tl.load(P + row).to(tl.int64)
     else:
         position = row
-    # The table is interleaved like the tail: (real, imag) per pair. The
-    # halves of each pair are picked with a 0/1 selector product summed
-    # over the pair axis, which is exact and needs no broadcast `where`.
-    rotated = lane < R
-    f = tl.load(
-        F + position[:, None, None] * FS + lane,
-        rotated if EXACT else live_tail,
-        other=0.0,
+    # The table is interleaved like the row, so element t of the tail reads
+    # entry t: the real part on even t, the imaginary part on odd t.
+    freq = F + position * FS + t
+    f_same = tl.load(freq, tail, other=0.0)
+    f_next = tl.load(freq + 1, to_next, other=0.0)
+    f_prev = tl.load(freq - 1, to_prev, other=0.0)
+    # Even t: real * f_real - imag * f_imag.
+    # Odd t: imag * f_real + real * f_imag.
+    rotated = tl.where(
+        odd,
+        y * f_prev + y_pair * f_same,
+        y * f_same - y_pair * f_next,
     )
-    take_real = (part == 0).to(tl.float32)[None, None, :]
-    take_imag = (part == 1).to(tl.float32)[None, None, :]
-    f_real = tl.sum(f * take_real, 2)
-    f_imag = tl.sum(f * take_imag, 2)
-    y_real = tl.sum(y_tail * take_real, 2)
-    y_imag = tl.sum(y_tail * take_imag, 2)
-    out_tail = (y_real * f_real - y_imag * f_imag)[
-        :, :, None
-    ] * take_real + (y_real * f_imag + y_imag * f_real)[:, :, None] * take_imag
-    if EXACT:
-        tl.store(
-            OUT + row[:, None] * D + head[None, :],
-            y_head.to(OUT.dtype.element_ty),
-        )
-        tl.store(
-            OUT + row[:, None, None] * D + N + lane,
-            out_tail.to(OUT.dtype.element_ty),
-        )
-    else:
-        tl.store(
-            OUT + row[:, None] * D + head[None, :],
-            y_head.to(OUT.dtype.element_ty),
-            live_head,
-        )
-        tl.store(
-            OUT + row[:, None, None] * D + N + lane,
-            out_tail.to(OUT.dtype.element_ty),
-            live_tail,
-        )
+    out = tl.where(tail, rotated, y)
+    tl.store(OUT + row * D + column, out.to(OUT.dtype.element_ty), inside)
 
 
 def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
-    """RMSNorm over the row, then RoPE on its interleaved rope tail."""
+    """RMSNorm over the row, then RoPE on its interleaved rope tail.
+
+    The SGLang kernel rewrites ``kv`` in place; this writes a new tensor and
+    leaves ``kv`` as it was, which is what the task's reference returns.
+    """
     m, d = kv.shape
+    # The task promises only that kv's last dimension is dense. The kernel
+    # reads weight and positions at unit stride, so a strided view of
+    # either is made contiguous first; is_contiguous() is a flag read and
+    # costs half a microsecond when there is nothing to do.
     if weight is not None and not weight.is_contiguous():
         weight = weight.contiguous()
     if positions is not None and not positions.is_contiguous():
         positions = positions.contiguous()
+    # The kernel indexes the table as interleaved (real, imag) floats, which
+    # needs the complex entries of a row next to each other.
     freqs = (
         freqs_cis if freqs_cis.stride(-1) == 1 else freqs_cis.contiguous()
     ).view(torch.float32)
     out = torch.empty_like(kv)
     if m:
-        r = freqs_cis.shape[-1] * 2
-        n = d - r
-        bh = 1 << (n - 1).bit_length()
-        hp = 1 << max((r // 2) - 1, 0).bit_length()
-        rows = 1 << min(3, max(0, (1024 // (bh + 2 * hp)).bit_length() - 1))
-        _split_rows.run(
+        b = 1 << (d - 1).bit_length()
+        _row.run(
             kv,
             weight,
             freqs,
             positions,
             out,
-            m,
             d,
-            r,
+            freqs_cis.shape[-1] * 2,
             kv.stride(0),
             freqs.stride(0),
             eps,
             weight is not None,
             positions is not None,
-            bh,
-            hp,
-            rows,
-            grid=((m + rows - 1) // rows,),
+            b,
+            grid=(m,),
             warmup=False,
-            num_warps=1,
+            num_warps=4 if b <= 4096 else 8,
             isCloseMemoryAsync=False,
         )
     return out
