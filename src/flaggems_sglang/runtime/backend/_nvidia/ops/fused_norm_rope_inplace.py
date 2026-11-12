@@ -71,6 +71,7 @@ def _rotate_rows(
         + part[None, None, :],
         (row[:, None, None] < M) & rotated[None, :, None],
         other=0.0,
+        cache_modifier=".cg",
     )
     real = part[None, None, :] == 0
     f_real = tl.sum(tl.where(real, f, 0.0), 2)

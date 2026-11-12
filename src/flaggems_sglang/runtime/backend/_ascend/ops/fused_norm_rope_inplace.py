@@ -13,10 +13,7 @@ __all__ = ["fused_norm_rope_inplace"]
 CORES = 40
 
 
-@triton.jit(
-    do_not_specialize=["KV", "W", "F", "P", "OUT"],
-    do_not_specialize_on_alignment=["KV", "W", "F", "P", "OUT"],
-)
+@triton.jit
 def _rows(
     KV,
     W,
@@ -155,6 +152,8 @@ def fused_norm_rope_inplace(kv, weight, eps, freqs_cis, positions):
             (m + grid - 1) // grid,
             grid=(grid,),
             warmup=False,
+            # One warp per program, as graded faster on the other chips.
+            num_warps=1,
         )
     return out
 
